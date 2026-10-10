@@ -115,7 +115,7 @@ class SearchLeadsPayload:
     city: str
     state: str
     category: str
-    quantity: int = 20
+    quantity: int = 10
     filters: dict[str, Any] = field(default_factory=dict)
 
 
@@ -138,7 +138,7 @@ class Task:
     type: TaskType
     payload: TaskPayload
     created_at: str = field(default_factory=utc_now)
-    authorization: dict[str, bool] = field(default_factory=dict)
+    authorization: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: Any) -> Task:
@@ -166,11 +166,23 @@ class Task:
         authorization = data.get("authorization", {})
         if not isinstance(authorization, dict):
             raise ValueError("authorization deve ser um objeto")
-        allowed_authorizations = {"allow_credit_consumption", "allow_external_effects"}
+        allowed_authorizations = {
+            "allow_credit_consumption", "allow_external_effects", "authorized_by",
+        }
         if set(authorization) - allowed_authorizations:
             raise ValueError("authorization contém permissões desconhecidas")
-        if any(not isinstance(value, bool) for value in authorization.values()):
+        if any(
+            not isinstance(value, bool)
+            for name, value in authorization.items() if name != "authorized_by"
+        ):
             raise ValueError("permissões authorization devem ser booleanas")
+        authorized_by = authorization.get("authorized_by")
+        if authorized_by is not None and (
+            not isinstance(authorized_by, str) or authorized_by.strip().casefold() != "auren"
+        ):
+            raise ValueError("authorized_by deve identificar Auren")
+        if isinstance(authorized_by, str):
+            authorization["authorized_by"] = "auren"
         typed_payload = cls._validate_payload(task_type, payload)
         cls._validate_authorization(task_type, payload, authorization)
         return cls(
@@ -200,6 +212,8 @@ class Task:
         if missing:
             permissions = ", ".join(missing)
             raise ValueError(f"authorization explícita necessária: {permissions}")
+        if task_type == TaskType.SEARCH_LEADS and authorization.get("authorized_by") != "auren":
+            raise ValueError("authorization explícita do Auren necessária para iniciar um lote")
 
     @staticmethod
     def _validate_payload(task_type: TaskType, payload: dict[str, Any]) -> TaskPayload:
@@ -207,9 +221,9 @@ class Task:
             for name in ("city", "state", "category"):
                 validated = _required_text(payload.get(name), f"payload.{name}")
                 payload[name] = payload[name] if name == "city" else validated
-            quantity = payload.get("quantity", 20)
-            if isinstance(quantity, bool) or not isinstance(quantity, int) or not 1 <= quantity <= 100:
-                raise ValueError("payload.quantity deve ser um inteiro entre 1 e 100")
+            quantity = payload.get("quantity", 10)
+            if isinstance(quantity, bool) or not isinstance(quantity, int) or not 1 <= quantity <= 10:
+                raise ValueError("payload.quantity deve ser um inteiro entre 1 e 10")
             filters = payload.get("filters", {})
             if not isinstance(filters, dict):
                 raise ValueError("payload.filters deve ser um objeto")
@@ -242,6 +256,8 @@ class TaskResult:
     artifacts: list[dict[str, Any]] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    progress: dict[str, Any] = field(default_factory=dict)
+    worker_pid: int | None = None
     error: dict[str, str] | None = None
     started_at: str = field(default_factory=utc_now)
     finished_at: str = field(default_factory=utc_now)
@@ -253,6 +269,8 @@ class TaskResult:
             "leads": leads,
             "artifacts": self.artifacts,
             "warnings": self.warnings,
+            "progress": self.progress,
+            "worker_pid": self.worker_pid,
         }
         return {
             "task_id": self.task_id,
@@ -265,6 +283,8 @@ class TaskResult:
             "artifacts": self.artifacts,
             "errors": self.errors,
             "warnings": self.warnings,
+            "progress": self.progress,
+            "worker_pid": self.worker_pid,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
         }

@@ -48,6 +48,7 @@ class FakeBrowserController:
         self.text = "Pesquisa de empresas"
         self.links = []
         self.fail_wait = False
+        self.no_results = False
         self.selected_city = None
         self.category_options = category_options if category_options is not None else [
             "Restaurantes, padarias e lanchonetes",
@@ -181,6 +182,10 @@ class FakeBrowserController:
     def capture_page_state(self):
         return {"url": self.page.url, "text_hash": str(self.page_index)}
 
+    def capture_search_results_state(self):
+        self.operations.append(("capture_search_results_state",))
+        return {"url": self.page.url, "results_hash": "before-search"}
+
     def click_button(self, *, text, **target):
         self.operations.append(("click_button", text))
         if text in {"Buscar", "Ver agora"}:
@@ -201,6 +206,17 @@ class FakeBrowserController:
         if self.fail_wait:
             raise TimeoutError("A página não mudou")
         return True
+
+    def wait_for_stable_search_results(self, before, timeout_ms=20_000, stable_ms=750):
+        self.operations.append(("wait_for_stable_search_results", timeout_ms, stable_ms))
+        if self.fail_wait:
+            raise TimeoutError("Resultados reais e estáveis não apareceram")
+        records = self.read_semantic_records()
+        return {
+            "record_count": len(records),
+            "no_results": self.no_results and not records,
+            "signature": str(self.page_index),
+        }
 
     def read_semantic_records(self):
         index = min(self.page_index, len(self.pages) - 1)
@@ -229,6 +245,19 @@ class AivioIntegrationTests(unittest.TestCase):
     def test_search_requires_explicit_credit_authorization(self):
         with self.assertRaisesRegex(PermissionError, "autorização explícita"):
             self.integration.search_leads("Porto Alegre", "RS", "restaurantes")
+        self.assertFalse(any(item[0] == "click_button" for item in self.controller.operations))
+
+    def test_search_batch_is_limited_to_ten_leads(self):
+        for quantity in (0, 11, 100, True):
+            with self.subTest(quantity=quantity):
+                with self.assertRaisesRegex(ValueError, "entre 1 e 10"):
+                    self.integration.search_leads(
+                        "Porto Alegre",
+                        "RS",
+                        "restaurantes",
+                        quantity=quantity,
+                        allow_credit_consumption=True,
+                    )
         self.assertFalse(any(item[0] == "click_button" for item in self.controller.operations))
 
     def test_search_uses_confirmed_control_names_and_returns_normalized_leads(self):
@@ -272,7 +301,28 @@ class AivioIntegrationTests(unittest.TestCase):
         self.assertLess(operations.index("wait_for_dropdown_open"), operations.index("select_option"))
         self.assertLess(operations.index("select_option"), operations.index("click_button"))
         self.assertNotIn(("read_inputs",), self.controller.operations)
+        self.assertTrue(any(
+            item[0] == "wait_for_stable_search_results"
+            for item in self.controller.operations
+        ))
+
+    def test_structured_search_defaults_to_ten_without_changing_legacy_search_city(self):
+        structured = self.integration.search_leads(
+            "Porto Alegre", "RS", "restaurantes", allow_credit_consumption=True,
+        )
+        self.assertEqual(structured["requested_quantity"], 10)
+
+        self.controller.operations.clear()
+        legacy = self.integration.search_city(
+            "Porto Alegre", allow_credit_consumption=True,
+        )
+
+        self.assertEqual(legacy["status"], "completed")
         self.assertTrue(any(item[0] == "wait_for_page_change" for item in self.controller.operations))
+        self.assertFalse(any(
+            item[0] == "capture_search_results_state"
+            for item in self.controller.operations
+        ))
 
     def test_select_category_uses_shared_dropdown_logic_without_search(self):
         category = "Restaurantes, padarias e lanchonetes"
@@ -419,10 +469,22 @@ class AivioIntegrationTests(unittest.TestCase):
 
     def test_page_change_timeout_is_not_reported_as_success(self):
         self.controller.fail_wait = True
-        with self.assertRaisesRegex(TimeoutError, "página não mudou"):
+        with self.assertRaisesRegex(TimeoutError, "Resultados reais e estáveis"):
             self.integration.search_leads(
                 "Porto Alegre", "RS", "restaurantes", allow_credit_consumption=True,
             )
+
+    def test_explicit_no_results_is_returned_as_empty_partial_batch(self):
+        self.controller.pages = [[]]
+        self.controller.no_results = True
+
+        result = self.integration.search_leads(
+            "Porto Alegre", "RS", "restaurantes", allow_credit_consumption=True,
+        )
+
+        self.assertEqual(result["results"], [])
+        self.assertEqual(result["status"], "partial")
+        self.assertTrue(any("0 leads válidos" in warning for warning in result["warnings"]))
 
     def test_health_reports_edge_version_endpoint_and_expected_v2_profile(self):
         health = self.integration.browser_health()

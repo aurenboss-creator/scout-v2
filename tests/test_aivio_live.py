@@ -19,9 +19,10 @@ def _live_task_authorized():
     authorization = {
         "allow_credit_consumption": os.getenv("SCOUT_AIVIO_LIVE_ALLOW_CREDIT_CONSUMPTION") == "1",
         "allow_external_effects": os.getenv("SCOUT_AIVIO_LIVE_ALLOW_EXTERNAL_EFFECTS") == "1",
+        "authorized_by": os.getenv("SCOUT_AIVIO_LIVE_AUTHORIZED_BY", "").casefold(),
     }
     if task_type in {"SEARCH_LEADS"}:
-        return authorization["allow_credit_consumption"]
+        return authorization["allow_credit_consumption"] and authorization["authorized_by"] == "auren"
     if task_type == "OPEN_COMPANY":
         lead = payload.get("lead", {})
         if isinstance(lead, dict) and not (lead.get("company_url") or lead.get("source_url")):
@@ -81,6 +82,7 @@ class LiveV2TaskTests(unittest.TestCase):
                     os.getenv("SCOUT_AIVIO_LIVE_ALLOW_CREDIT_CONSUMPTION") == "1",
                 "allow_external_effects":
                     os.getenv("SCOUT_AIVIO_LIVE_ALLOW_EXTERNAL_EFFECTS") == "1",
+                "authorized_by": os.getenv("SCOUT_AIVIO_LIVE_AUTHORIZED_BY", "").casefold(),
             },
         })
         self.assertNotIn(result.status.value, {"failed", "timeout"}, msg="; ".join(result.errors))

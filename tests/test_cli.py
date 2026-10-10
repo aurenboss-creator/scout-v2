@@ -381,7 +381,7 @@ class CliTests(unittest.TestCase):
                     "task",
                     "SEARCH_LEADS",
                     "--authorization",
-                    '{"allow_credit_consumption":true}',
+                    '{"allow_credit_consumption":true,"authorized_by":"auren"}',
                     "--payload",
                     '{"city":"Porto Alegre","state":"RS","category":"restaurantes"}',
                 ],

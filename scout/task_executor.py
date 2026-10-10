@@ -16,6 +16,8 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from scout.aivio import AivioIntegration, CDP_ENDPOINT
 from scout.browser_controller import BrowserController
+from scout.lead_normalization import deduplicate_leads
+from scout.storage import V2StateStore
 from scout.v2_models import (
     LeadTaskPayload,
     SearchLeadsPayload,
@@ -95,6 +97,7 @@ class TaskExecutor:
         self,
         integration: AivioIntegration | None = None,
         browser_controller: BrowserController | None = None,
+        state_store: V2StateStore | None = None,
     ) -> None:
         timeout = int(os.getenv("SCOUT_AIVIO_GENERATION_TIMEOUT_MS", "120000"))
         if integration is None:
@@ -107,8 +110,24 @@ class TaskExecutor:
         self._browser_endpoint = (
             getattr(self.browser_controller, "cdp_endpoint", None) or CDP_ENDPOINT
         )
+        self.state_store = state_store or V2StateStore()
         self._task_results: dict[str, TaskResult] = {}
         self._task_results_lock = RLock()
+        for task_id, record in self.state_store.load_task_records().items():
+            result = self._result_from_dict(record)
+            if (
+                result.status in {TaskStatus.QUEUED, TaskStatus.RUNNING}
+                and not self._process_is_alive(result.worker_pid)
+            ):
+                result.status = TaskStatus.FAILED
+                result.error = {
+                    "code": "task_interrupted",
+                    "message": "A tarefa foi interrompida antes da conclusão; não foi repetida automaticamente.",
+                }
+                result.errors.append(result.error["message"])
+                result.finished_at = datetime.now(timezone.utc).isoformat()
+                self.state_store.save_task_record(task_id, result.to_dict())
+            self._task_results[task_id] = result
 
     def execute(self, value: Task | dict[str, Any]) -> TaskResult:
         task = value if isinstance(value, Task) else Task.from_dict(value)
@@ -118,9 +137,13 @@ class TaskExecutor:
             status=TaskStatus.QUEUED,
             started_at="",
             finished_at="",
+            worker_pid=os.getpid(),
         )
         with self._task_results_lock:
-            if task.task_id in self._task_results:
+            if (
+                task.task_id in self._task_results
+                or not self.state_store.create_task_record(task.task_id, queued_result.to_dict())
+            ):
                 raise ValueError(f"task_id já foi executado: {task.task_id}")
             self._task_results[task.task_id] = queued_result
         try:
@@ -128,9 +151,11 @@ class TaskExecutor:
                 with self._task_results_lock:
                     queued_result.status = TaskStatus.RUNNING
                     queued_result.started_at = datetime.now(timezone.utc).isoformat()
+                    self._persist_result(queued_result)
                 result = self._execute_task(task, queued_result)
                 with self._task_results_lock:
                     result.finished_at = datetime.now(timezone.utc).isoformat()
+                    self._persist_result(result)
                 return result
         except Exception as error:
             message = _safe_error_message(error)
@@ -140,11 +165,16 @@ class TaskExecutor:
                 queued_result.errors.append(message)
                 queued_result.error = {"code": "task_start_failed", "message": message}
                 queued_result.finished_at = datetime.now(timezone.utc).isoformat()
+                self._persist_result(queued_result)
             return queued_result
 
     def get_task_result(self, task_id: str) -> dict[str, Any] | None:
         with self._task_results_lock:
             result = self._task_results.get(task_id)
+            persisted = self.state_store.get_task_record(task_id)
+            if persisted is not None:
+                result = self._result_from_dict(persisted)
+                self._task_results[task_id] = result
             if result is None:
                 return None
             if result.finished_at:
@@ -154,6 +184,7 @@ class TaskExecutor:
                 task_id=result.task_id,
                 type=result.type,
                 status=status,
+                progress=dict(result.progress),
                 started_at=result.started_at,
                 finished_at="",
             )
@@ -227,6 +258,48 @@ class TaskExecutor:
         if connect is not None:
             connect()
 
+    def _persist_result(self, result: TaskResult) -> None:
+        self.state_store.save_task_record(result.task_id, result.to_dict())
+
+    def _update_progress(self, result: TaskResult, progress: dict[str, Any]) -> None:
+        with self._task_results_lock:
+            result.progress = dict(progress)
+            self._persist_result(result)
+
+    @staticmethod
+    def _result_from_dict(record: dict[str, Any]) -> TaskResult:
+        try:
+            result = TaskResult(
+                task_id=record["task_id"],
+                type=TaskType(record["type"]),
+                status=TaskStatus(record["status"]),
+                data=record.get("data", {}),
+                leads=[V2Lead.from_dict(item) for item in record.get("leads", [])],
+                artifacts=record.get("artifacts", []),
+                errors=record.get("errors", []),
+                warnings=record.get("warnings", []),
+                progress=record.get("progress", {}),
+                worker_pid=record.get("worker_pid"),
+                error=record.get("error"),
+                started_at=record.get("started_at", ""),
+                finished_at=record.get("finished_at", ""),
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError("Registro persistido de tarefa V2 inválido") from error
+        return result
+
+    @staticmethod
+    def _process_is_alive(process_id: int | None) -> bool:
+        if isinstance(process_id, bool) or not isinstance(process_id, int) or process_id < 1:
+            return False
+        try:
+            os.kill(process_id, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
     def _search_leads(self, task: Task, result: TaskResult) -> None:
         payload = task.payload
         if not isinstance(payload, SearchLeadsPayload):
@@ -243,8 +316,19 @@ class TaskExecutor:
             quantity=payload.quantity,
             filters=filters,
             allow_credit_consumption=task.authorization.get("allow_credit_consumption") is True,
+            on_progress=lambda progress: self._update_progress(result, progress),
         )
-        result.leads = [V2Lead.from_dict(item) for item in search["results"]]
+        known_leads = [V2Lead.from_dict(item) for item in self.state_store.load_leads()]
+        batch_leads = [V2Lead.from_dict(item) for item in search["results"]]
+        known_ids = {lead.lead_id for lead in known_leads}
+        combined_leads = deduplicate_leads(known_leads + batch_leads)
+        self.state_store.replace_leads([lead.to_dict() for lead in combined_leads])
+        result.leads = [lead for lead in combined_leads if lead.lead_id not in known_ids]
+        duplicate_count = max(0, len(batch_leads) - len(result.leads))
+        if duplicate_count:
+            result.warnings.append(
+                f"{duplicate_count} lead(s) já existentes foram ignorados neste lote."
+            )
         result.warnings.extend(warnings)
         result.warnings.extend(search.get("warnings", []))
         result.data = {
@@ -253,8 +337,10 @@ class TaskExecutor:
             "category": search["category"],
             "requested_quantity": search["requested_quantity"],
             "total": len(result.leads),
+            "unique_total": len(combined_leads),
+            "duplicates_skipped": duplicate_count,
         }
-        if search["status"] == "partial" or warnings:
+        if search["status"] == "partial" or warnings or duplicate_count:
             result.status = TaskStatus.PARTIAL
 
     def _open_company(self, task: Task, result: TaskResult) -> None:

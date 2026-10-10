@@ -17,8 +17,9 @@ from scout.lead_normalization import (
     normalize_text,
     normalize_url,
 )
+from scout.storage import V2StateStore
 from scout.task_executor import TaskExecutor, _browser_execution_lock
-from scout.v2_models import SearchLeadsPayload, Task, TaskStatus, TaskType, V2Lead
+from scout.v2_models import SearchLeadsPayload, Task, TaskResult, TaskStatus, TaskType, V2Lead
 
 
 def task_request(task_type, payload=None, authorization=None):
@@ -46,6 +47,9 @@ class FakeIntegration:
 
     def search_leads(self, **kwargs):
         self.search_authorization = kwargs.get("allow_credit_consumption")
+        on_progress = kwargs.get("on_progress")
+        if on_progress is not None:
+            on_progress({"phase": "results_ready", "page": 1, "record_count": 1})
         return {
             "status": "completed",
             "city": kwargs["city"],
@@ -79,13 +83,13 @@ class TaskContractTests(unittest.TestCase):
                 task = Task.from_dict(task_request(
                     "SEARCH_LEADS",
                     {"city": city, "state": "RS", "category": "restaurantes"},
-                    authorization={"allow_credit_consumption": True},
+                    authorization={"allow_credit_consumption": True, "authorized_by": "auren"},
                 ))
                 self.assertEqual(task.payload.city, city)
 
     def test_search_requires_boss_supplied_city_and_category(self):
         base = {"city": "Porto Alegre", "state": "RS", "category": "restaurantes"}
-        authorization = {"allow_credit_consumption": True}
+        authorization = {"allow_credit_consumption": True, "authorized_by": "auren"}
         for missing in ("city", "category"):
             with self.subTest(missing=missing):
                 payload = {key: value for key, value in base.items() if key != missing}
@@ -99,10 +103,22 @@ class TaskContractTests(unittest.TestCase):
     def test_search_task_validates_required_payload_and_uuid(self):
         task = Task.from_dict(task_request("SEARCH_LEADS", {
             "city": "Porto Alegre", "state": "RS", "category": "restaurantes",
-            "quantity": 20, "filters": {"has_website": False},
-        }, authorization={"allow_credit_consumption": True}))
+            "quantity": 10, "filters": {"has_website": False},
+        }, authorization={"allow_credit_consumption": True, "authorized_by": "auren"}))
         self.assertEqual(task.type, TaskType.SEARCH_LEADS)
         self.assertIsInstance(task.payload, SearchLeadsPayload)
+        self.assertEqual(task.payload.quantity, 10)
+        default_quantity_task = Task.from_dict(task_request("SEARCH_LEADS", {
+            "city": "Porto Alegre", "state": "RS", "category": "restaurantes",
+        }, authorization={"allow_credit_consumption": True, "authorized_by": "auren"}))
+        self.assertEqual(default_quantity_task.payload.quantity, 10)
+        for quantity in (0, 11, 100, True):
+            with self.subTest(quantity=quantity):
+                with self.assertRaisesRegex(ValueError, "entre 1 e 10"):
+                    Task.from_dict(task_request("SEARCH_LEADS", {
+                        "city": "Porto Alegre", "state": "RS", "category": "restaurantes",
+                        "quantity": quantity,
+                    }, authorization={"allow_credit_consumption": True, "authorized_by": "auren"}))
         with self.assertRaisesRegex(ValueError, "UUID"):
             Task.from_dict({"task_id": "not-a-uuid", "type": "HEALTH_CHECK", "payload": {}})
         with self.assertRaisesRegex(ValueError, "payload.state"):
@@ -113,6 +129,14 @@ class TaskContractTests(unittest.TestCase):
             Task.from_dict(task_request("SEARCH_LEADS", {
                 "city": "Porto Alegre", "state": "RS", "category": "restaurantes",
             }))
+        with self.assertRaisesRegex(ValueError, "do Auren"):
+            Task.from_dict(task_request("SEARCH_LEADS", {
+                "city": "Porto Alegre", "state": "RS", "category": "restaurantes",
+            }, authorization={"allow_credit_consumption": True}))
+        with self.assertRaisesRegex(ValueError, "identificar Auren"):
+            Task.from_dict(task_request("SEARCH_LEADS", {
+                "city": "Porto Alegre", "state": "RS", "category": "restaurantes",
+            }, authorization={"allow_credit_consumption": True, "authorized_by": "operator"}))
 
     def test_lead_round_trip_has_standard_fields(self):
         lead = V2Lead(company_name="Restaurante Exemplo", city="Porto Alegre")
@@ -189,15 +213,63 @@ class LeadNormalizationTests(unittest.TestCase):
         self.assertTrue(result[0].raw_data["duplicates"])
 
 
+class V2StateStoreTests(unittest.TestCase):
+    def test_task_records_and_leads_survive_store_reinitialization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "state.json")
+            lead = V2Lead(company_name="Empresa Persistida").to_dict()
+            record = {"status": "completed", "progress": {"pages": 1}}
+
+            first = V2StateStore(path)
+            first.save_task_record("task-1", record)
+            first.replace_leads([lead])
+            reopened = V2StateStore(path)
+
+            self.assertEqual(reopened.get_task_record("task-1"), record)
+            self.assertTrue(reopened.task_exists("task-1"))
+            self.assertEqual(reopened.load_leads(), [lead])
+
+    def test_open_store_instances_merge_task_updates_instead_of_overwriting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "state.json")
+            first = V2StateStore(path)
+            second = V2StateStore(path)
+
+            first.save_task_record("task-1", {"status": "completed"})
+            second.save_task_record("task-2", {"status": "running"})
+
+            self.assertEqual(
+                set(first.load_task_records()),
+                {"task-1", "task-2"},
+            )
+
+    def test_task_id_reservation_is_atomic_across_store_instances(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "state.json")
+            first = V2StateStore(path)
+            second = V2StateStore(path)
+
+            self.assertTrue(first.create_task_record("task-1", {"status": "queued"}))
+            self.assertFalse(second.create_task_record("task-1", {"status": "queued"}))
+
+
 class TaskExecutorTests(unittest.TestCase):
     def setUp(self):
+        self.state_directory = tempfile.TemporaryDirectory()
         self.integration = FakeIntegration()
-        self.executor = TaskExecutor(integration=self.integration)
+        self.state_path = os.path.join(self.state_directory.name, "state.json")
+        self.executor = TaskExecutor(
+            integration=self.integration,
+            state_store=V2StateStore(self.state_path),
+        )
+
+    def tearDown(self):
+        self.state_directory.cleanup()
 
     def test_executes_search_and_returns_standardized_result(self):
         request = task_request("SEARCH_LEADS", {
             "city": "Porto Alegre", "state": "RS", "category": "restaurantes",
-        }, authorization={"allow_credit_consumption": True})
+        }, authorization={"allow_credit_consumption": True, "authorized_by": "auren"})
         result = self.executor.execute(request).to_dict()
         self.assertEqual(result["task_id"], request["task_id"])
         self.assertEqual(result["type"], "SEARCH_LEADS")
@@ -209,6 +281,80 @@ class TaskExecutorTests(unittest.TestCase):
         self.assertEqual(result["result"]["leads"][0]["company_name"], "Restaurante Exemplo")
         self.assertIsNone(result["error"])
         self.assertTrue(self.integration.search_authorization)
+
+    def test_search_task_and_progress_survive_executor_restart(self):
+        request = task_request("SEARCH_LEADS", {
+            "city": "Porto Alegre", "state": "RS", "category": "restaurantes",
+        }, authorization={"allow_credit_consumption": True, "authorized_by": "auren"})
+
+        completed = self.executor.execute(request)
+        restarted = TaskExecutor(
+            integration=FakeIntegration(),
+            state_store=V2StateStore(self.state_path),
+        )
+
+        self.assertEqual(completed.status, TaskStatus.COMPLETED)
+        self.assertEqual(
+            restarted.get_task_result(request["task_id"])["progress"],
+            {"phase": "results_ready", "page": 1, "record_count": 1},
+        )
+        self.assertEqual(len(restarted.state_store.load_leads()), 1)
+        with self.assertRaisesRegex(ValueError, "já foi executado"):
+            restarted.execute(request)
+
+    def test_interrupted_search_is_marked_failed_without_automatic_replay(self):
+        task_id = str(uuid.uuid4())
+        interrupted = TaskResult(
+            task_id=task_id,
+            type=TaskType.SEARCH_LEADS,
+            status=TaskStatus.RUNNING,
+            started_at="2026-10-09T00:00:00+00:00",
+            finished_at="",
+        ).to_dict()
+        self.executor.state_store.save_task_record(task_id, interrupted)
+
+        restarted = TaskExecutor(
+            integration=FakeIntegration(),
+            state_store=V2StateStore(self.state_path),
+        )
+        recovered = restarted.get_task_result(task_id)
+
+        self.assertEqual(recovered["status"], "failed")
+        self.assertEqual(recovered["error"]["code"], "task_interrupted")
+        self.assertIsNone(restarted.integration.search_authorization)
+
+    def test_restart_does_not_mark_another_live_process_task_as_interrupted(self):
+        task_id = str(uuid.uuid4())
+        active = TaskResult(
+            task_id=task_id,
+            type=TaskType.SEARCH_LEADS,
+            status=TaskStatus.RUNNING,
+            worker_pid=os.getpid(),
+            finished_at="",
+        ).to_dict()
+        self.executor.state_store.save_task_record(task_id, active)
+
+        restarted = TaskExecutor(
+            integration=FakeIntegration(),
+            state_store=V2StateStore(self.state_path),
+        )
+
+        self.assertEqual(restarted.get_task_result(task_id)["status"], "running")
+
+    def test_duplicate_lead_from_later_batch_is_not_saved_or_returned_twice(self):
+        first = task_request("SEARCH_LEADS", {
+            "city": "Porto Alegre", "state": "RS", "category": "restaurantes",
+        }, authorization={"allow_credit_consumption": True, "authorized_by": "auren"})
+        second = task_request("SEARCH_LEADS", {
+            "city": "Porto Alegre", "state": "RS", "category": "restaurantes",
+        }, authorization={"allow_credit_consumption": True, "authorized_by": "auren"})
+
+        first_result = self.executor.execute(first)
+        second_result = self.executor.execute(second)
+
+        self.assertEqual(len(first_result.leads), 1)
+        self.assertEqual(second_result.leads, [])
+        self.assertEqual(len(self.executor.state_store.load_leads()), 1)
 
     def test_v2_defaults_to_its_own_cdp_endpoint(self):
         with patch.dict("os.environ", {}, clear=True):
@@ -297,6 +443,7 @@ class TaskExecutorTests(unittest.TestCase):
         queued_result = second.get_task_result(second_request["task_id"])
         self.assertEqual(queued_result["status"], "queued")
         self.assertEqual(queued_result["started_at"], "")
+        self.assertEqual(queued_result["finished_at"], "")
         self.assertFalse(second_entered.wait(timeout=0.05))
         release_first.set()
         for thread in threads:

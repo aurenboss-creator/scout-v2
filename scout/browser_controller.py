@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import re
@@ -211,6 +212,27 @@ INSPECT_CATEGORY_DOM_SCRIPT = """() => {
     category_button: categoryButton,
     elements: records
   };
+}"""
+SEARCH_RESULT_STATE_SCRIPT = """() => {
+    const visible = element => {
+        const rect = element.getBoundingClientRect();
+        const style = window.getComputedStyle(element);
+        return rect.width > 0 && rect.height > 0 &&
+            style.visibility !== 'hidden' && style.display !== 'none';
+    };
+    const records = Array.from(document.querySelectorAll(
+        'article,[role="article"],[role="listitem"]'
+    )).filter(visible).map(element =>
+        (element.innerText || element.textContent || '').trim()
+    ).filter(Boolean);
+    const text = (document.querySelector('main,[role="main"]') || document.body)
+        ?.innerText || '';
+    const noResults = records.length === 0 &&
+        /nenhum(?:a)? resultado|sem resultados|não encontramos resultados|nao encontramos resultados|no results|nothing found/i.test(text);
+    const loading = Boolean(document.querySelector(
+        '[aria-busy="true"],[role="progressbar"],[data-loading="true"]'
+    )) || /carregando|loading\\.\\.\\.|buscando resultados/i.test(text);
+    return {records, no_results: noResults, loading};
 }"""
 
 _SENSITIVE_TEXT_PATTERNS = (
@@ -682,11 +704,79 @@ class BrowserController:
             })"""
         )
 
+    def wait_for_stable_search_results(
+        self,
+        before: dict[str, str],
+        timeout_ms: int = 20_000,
+        stable_ms: int = 750,
+    ) -> dict[str, Any]:
+        self._validate_timeout(timeout_ms)
+        if isinstance(stable_ms, bool) or not isinstance(stable_ms, int) or stable_ms < 1:
+            raise ValueError("stable_ms deve ser um inteiro positivo")
+        page = self.getActivePage()
+        if page is None:
+            raise RuntimeError("Não há uma aba ativa disponível")
+        deadline = time.monotonic() + timeout_ms / 1_000
+        previous_signature: str | None = None
+        stable_since: float | None = None
+        loading_seen = False
+        while True:
+            state = page.evaluate(SEARCH_RESULT_STATE_SCRIPT)
+            if not isinstance(state, dict) or not isinstance(state.get("records"), list):
+                raise RuntimeError("O estado dos resultados da página é inválido")
+            loading_seen = loading_seen or state.get("loading") is True
+            records = [item for item in state["records"] if isinstance(item, str) and item.strip()]
+            no_results = state.get("no_results") is True and not records
+            signature = json.dumps(
+                {"records": records, "no_results": no_results},
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            fresh = signature != before.get("results_hash") or loading_seen
+            if (records or no_results) and not state.get("loading") and fresh:
+                now = time.monotonic()
+                if signature != previous_signature:
+                    previous_signature = signature
+                    stable_since = now
+                elif stable_since is not None and (now - stable_since) * 1_000 >= stable_ms:
+                    return {
+                        "record_count": len(records),
+                        "no_results": no_results,
+                        "signature": signature,
+                    }
+            else:
+                previous_signature = None
+                stable_since = None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise PlaywrightTimeoutError(
+                    f"Resultados reais e estáveis não apareceram em {timeout_ms} ms"
+                )
+            page.wait_for_timeout(min(100, max(1, int(remaining * 1_000))))
+
     def capture_page_state(self) -> dict[str, str]:
         page = self.getActivePage()
         if page is None:
             raise RuntimeError("Não há uma aba ativa disponível")
         return self._snapshot_page(page)
+
+    def capture_search_results_state(self) -> dict[str, str]:
+        page = self.getActivePage()
+        if page is None:
+            raise RuntimeError("Não há uma aba ativa disponível")
+        state = page.evaluate(SEARCH_RESULT_STATE_SCRIPT)
+        if not isinstance(state, dict) or not isinstance(state.get("records"), list):
+            raise RuntimeError("O estado dos resultados da página é inválido")
+        records = [item for item in state["records"] if isinstance(item, str) and item.strip()]
+        no_results = state.get("no_results") is True and not records
+        return {
+            "url": self._safe_page_url(page.url),
+            "results_hash": json.dumps(
+                {"records": records, "no_results": no_results},
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+        }
 
     def verify_page_changed(self, before: dict[str, str], timeout_ms: int = 1_000) -> bool:
         if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int) or timeout_ms < 1:

@@ -14,7 +14,7 @@ O AUREN BOSS decide objetivo, cidade/região, categoria, quantidade, pesquisa, a
 - `scout/research.py`: valida fontes dos dados, executa auditoria de site e calcula score.
 - `scout/website.py`: auditoria HTTP/HTML, com limites de resposta, validação de hosts públicos e respeito a `robots.txt`.
 - `scout/scoring.py`: pontuação e classificação sem dependência de rede ou do provedor.
-- `scout/storage.py`: armazenamento em memória, protegido para uso pela API concorrente.
+- `scout/storage.py`: `LeadStore` em memória para o fluxo legado e estado JSON durável isolado para tarefas/leads V2.
 - `scout/service.py`: coordenação, ordenação e logs da pesquisa.
 - `scout/api.py` e `scout/cli.py`: interface HTTP e inicialização.
 - `scout/browser_controller.py`: conexão e controle isolado do Microsoft Edge via CDP.
@@ -172,9 +172,9 @@ Antes de executar tarefas, inicie o Edge CDP como descrito acima, abra o AIVIO n
 
 ### API de tarefas
 
-`POST /tasks` aceita `SEARCH_LEADS`, `OPEN_COMPANY`, `GENERATE_SITE` e `HEALTH_CHECK`. As respostas contêm `task_id`, `type`, `status`, `result`, `error`, `started_at` e `finished_at`, além dos campos de compatibilidade `data`, `leads`, `artifacts`, `errors` e `warnings`. O executor serializa as tarefas de browser entre processos que usam o mesmo CDP; tarefas aguardando esse lock ficam `queued` e, ao iniciar, passam a `running`. `GET /tasks/{task_id}` consulta o estado/resultados mantidos em memória durante a execução atual do processo. Um `task_id` não pode ser reutilizado pelo mesmo executor. Falhas retornam status HTTP de erro; timeouts retornam `timeout`/HTTP 504.
+`POST /tasks` aceita `SEARCH_LEADS`, `OPEN_COMPANY`, `GENERATE_SITE` e `HEALTH_CHECK`. As respostas contêm `task_id`, `type`, `status`, `result`, `error`, `started_at` e `finished_at`, além dos campos de compatibilidade `data`, `leads`, `artifacts`, `errors` e `warnings`. O executor serializa as tarefas de browser entre processos que usam o mesmo CDP; tarefas aguardando esse lock ficam `queued` e, ao iniciar, passam a `running`. Tarefas, progresso e leads V2 são persistidos em JSON e podem ser consultados após reiniciar o processo. Tarefas que estavam em execução durante a interrupção são marcadas como falhas, sem repetição automática. Um `task_id` persistido não pode ser reutilizado. Falhas retornam status HTTP de erro; timeouts retornam `timeout`/HTTP 504.
 
-O consumo de créditos e efeitos externos não são autorizados por padrão. Para `SEARCH_LEADS` e busca de empresa sem URL, `authorization.allow_credit_consumption` precisa ser `true`. Para `GENERATE_SITE`, `authorization.allow_credit_consumption` e `authorization.allow_external_effects` precisam ser `true`. Essas permissões devem ser fornecidas pelo AUREN em cada tarefa; tarefas sem autorização são rejeitadas.
+O consumo de créditos e efeitos externos não são autorizados por padrão. Para `SEARCH_LEADS`, cada lote exige `authorization.allow_credit_consumption: true` e `authorization.authorized_by: "auren"`; a quantidade máxima é 10 e cada tarefa autorizada inicia no máximo um lote. Para busca de empresa sem URL, `authorization.allow_credit_consumption` precisa ser `true`. Para `GENERATE_SITE`, `authorization.allow_credit_consumption` e `authorization.allow_external_effects` precisam ser `true`. Tarefas sem as permissões exigidas são rejeitadas.
 
 Exemplo `SEARCH_LEADS`:
 
@@ -183,24 +183,25 @@ Exemplo `SEARCH_LEADS`:
   "task_id": "2c6b72b1-68a4-4a51-bf59-68aa96832ad5",
   "type": "SEARCH_LEADS",
   "authorization": {
-    "allow_credit_consumption": true
+    "allow_credit_consumption": true,
+    "authorized_by": "auren"
   },
   "payload": {
     "city": "Porto Alegre",
     "state": "RS",
     "category": "restaurantes",
-    "quantity": 20,
+    "quantity": 10,
     "filters": {}
   }
 }
 ```
 
-`quantity` aceita 1–100. `filters.has_website` é opcional; resultados sem evidência explícita de site não são tratados como empresas sem site. Filtros desconhecidos são indicados em `warnings`, não aplicados silenciosamente.
+`quantity` aceita de 1 a 10 leads por lote. Cada novo lote exige uma nova tarefa explicitamente autorizada pelo AUREN. `filters.has_website` é opcional; resultados sem evidência explícita de site não são tratados como empresas sem site. Filtros desconhecidos são indicados em `warnings`, não aplicados silenciosamente.
 
 Exemplos de execução local (substitua o lead de `OPEN_COMPANY`/`GENERATE_SITE` por um lead observado no AIVIO):
 
 ```powershell
-python -m scout task SEARCH_LEADS --authorization '{"allow_credit_consumption":true}' --payload '{"city":"Porto Alegre","state":"RS","category":"restaurantes","quantity":20,"filters":{}}'
+python -m scout task SEARCH_LEADS --authorization '{"allow_credit_consumption":true,"authorized_by":"auren"}' --payload '{"city":"Porto Alegre","state":"RS","category":"restaurantes","quantity":10,"filters":{}}'
 python -m scout task OPEN_COMPANY --payload '{"lead":{"company_name":"Restaurante Exemplo","city":"Porto Alegre","state":"RS","company_url":"https://app.aivio.example/company/123"}}'
 python -m scout task GENERATE_SITE --authorization '{"allow_credit_consumption":true,"allow_external_effects":true}' --payload '{"lead":{"company_name":"Restaurante Exemplo","city":"Porto Alegre","state":"RS","company_url":"https://app.aivio.example/company/123"}}'
 ```
@@ -224,6 +225,7 @@ Como o AIVIO não fornece neste repositório um contrato estável de DOM/URL, a 
 | `SCOUT_PORT` | `8080` | Porta HTTP. |
 | `SCOUT_LOG_LEVEL` | `INFO` | Nível de log. |
 | `SCOUT_CDP_ENDPOINT` | `http://127.0.0.1:9223` no V2; V1 permanece em `http://127.0.0.1:9222` | Endpoint CDP local da versão correspondente. O V2 aceita somente seu endereço loopback HTTP em `127.0.0.1:9223`; a V1 permanece isolada em `127.0.0.1:9222`. |
+| `SCOUT_V2_STATE_PATH` | `~/.auren-scout-v2/state.json` | Caminho do arquivo JSON persistente exclusivo da V2. |
 | `SCOUT_AIVIO_GENERATION_TIMEOUT_MS` | `120000` | Timeout da espera condicional da geração do site (1000–600000 ms). |
 
 O Browser Controller valida que o endpoint fala com Microsoft Edge e não armazena credenciais, cookies ou tokens. Não configure credenciais na URL do endpoint.
@@ -255,7 +257,7 @@ Executa uma tarefa V2 estruturada. Os tipos aceitos são `SEARCH_LEADS`, `OPEN_C
 
 ### `GET /tasks/{task_id}`
 
-Retorna o estado e o resultado da tarefa armazenados em memória neste processo. Os estados `queued` e `running` podem ser consultados enquanto outra tarefa usa o navegador; `completed`, `partial`, `failed` e `timeout` representam estados terminais. A consulta retorna HTTP 404 se o ID não for conhecido.
+Retorna o estado, progresso e resultado persistidos da tarefa. Os estados `queued` e `running` podem ser consultados enquanto outra tarefa usa o navegador; `completed`, `partial`, `failed` e `timeout` representam estados terminais. A consulta retorna HTTP 404 se o ID não for conhecido.
 
 Exemplo de consulta:
 

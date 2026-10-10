@@ -2,9 +2,12 @@ import json
 import unittest
 from unittest.mock import patch
 
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
 from scout.browser_controller import (
     INSPECT_CATEGORY_DOM_SCRIPT,
     INSPECT_PAGE_SCRIPT,
+    SEARCH_RESULT_STATE_SCRIPT,
     BrowserController,
     V1_CDP_ENDPOINT,
     V2_CDP_ENDPOINT,
@@ -22,6 +25,8 @@ class FakePage:
         self.category_clicked = False
         self.category_button_count = 1
         self.category_inspections = []
+        self.search_result_states = []
+        self.last_search_result_state = None
 
     def is_closed(self):
         return False
@@ -30,6 +35,12 @@ class FakePage:
         return self._title
 
     def evaluate(self, expression):
+        if expression == SEARCH_RESULT_STATE_SCRIPT:
+            if self.search_result_states:
+                self.last_search_result_state = self.search_result_states.pop(0)
+            return self.last_search_result_state or {
+                "records": [], "no_results": False, "loading": False,
+            }
         if expression == INSPECT_CATEGORY_DOM_SCRIPT:
             return self.category_inspections.pop(0)
         if expression == INSPECT_PAGE_SCRIPT:
@@ -201,6 +212,54 @@ class BrowserControllerTests(unittest.TestCase):
         for url in ("javascript:alert(1)", "file:///etc/passwd", "https://user:pass@example.com/"):
             with self.subTest(url=url), self.assertRaises(ValueError):
                 self.controller.navigate(url)
+
+    def test_waits_for_dynamic_results_and_stability(self):
+        self.active_page.search_result_states = [
+            {"records": [], "no_results": False, "loading": True},
+            {"records": ["Empresa real"], "no_results": False, "loading": False},
+            {"records": ["Empresa real"], "no_results": False, "loading": False},
+            {"records": ["Empresa real"], "no_results": False, "loading": False},
+        ]
+        self.controller._active_page_override = self.active_page
+
+        result = self.controller.wait_for_stable_search_results(
+            {"url": "https://aivio.example/search", "results_hash": "old"},
+            timeout_ms=1_000,
+            stable_ms=1,
+        )
+
+        self.assertEqual(result["record_count"], 1)
+        self.assertFalse(result["no_results"])
+
+    def test_accepts_stable_explicit_empty_results(self):
+        self.active_page.search_result_states = [
+            {"records": [], "no_results": True, "loading": False},
+            {"records": [], "no_results": True, "loading": False},
+            {"records": [], "no_results": True, "loading": False},
+        ]
+        self.controller._active_page_override = self.active_page
+
+        result = self.controller.wait_for_stable_search_results(
+            {"url": "https://aivio.example/search", "results_hash": "old"},
+            timeout_ms=1_000,
+            stable_ms=1,
+        )
+
+        self.assertEqual(result["record_count"], 0)
+        self.assertTrue(result["no_results"])
+
+    def test_url_change_without_results_times_out(self):
+        self.active_page.search_result_states = [
+            {"records": [], "no_results": False, "loading": False},
+        ]
+        self.controller._active_page_override = self.active_page
+
+        with self.assertRaisesRegex(PlaywrightTimeoutError, "Resultados reais e estáveis"):
+            self.controller.wait_for_stable_search_results(
+                {"url": "https://aivio.example/before", "results_hash": "old"},
+                timeout_ms=2,
+                stable_ms=1,
+            )
 
     def test_endpoint_is_required_and_must_not_contain_credentials(self):
         with self.assertRaisesRegex(RuntimeError, "SCOUT_CDP_ENDPOINT"):

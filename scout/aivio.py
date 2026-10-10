@@ -3,7 +3,7 @@ import hashlib
 import json
 import logging
 import re
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from playwright.sync_api import Page
@@ -99,10 +99,11 @@ class AivioIntegration:
         city: str,
         state: str,
         category: str,
-        quantity: int = 20,
+        quantity: int = 10,
         filters: dict[str, Any] | None = None,
         *,
         allow_credit_consumption: bool = False,
+        on_progress: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         if not allow_credit_consumption:
             raise PermissionError("SEARCH_LEADS exige autorização explícita para possível consumo de créditos")
@@ -110,8 +111,8 @@ class AivioIntegration:
         for name, value in search_values.items():
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"Informe {name} para pesquisar")
-        if isinstance(quantity, bool) or not isinstance(quantity, int) or not 1 <= quantity <= 100:
-            raise ValueError("quantity deve ser um inteiro entre 1 e 100")
+        if isinstance(quantity, bool) or not isinstance(quantity, int) or not 1 <= quantity <= 10:
+            raise ValueError("quantity deve ser um inteiro entre 1 e 10")
         filters = filters or {}
         if not isinstance(filters, dict):
             raise ValueError("filters deve ser um objeto")
@@ -120,7 +121,11 @@ class AivioIntegration:
 
         self._require_aivio_page()
         self._fill_search_fields(search_values)
-        raw_results, search_warnings = self._run_search_pages(quantity, filters)
+        raw_results, search_warnings = self._run_search_pages(
+            quantity,
+            filters,
+            on_progress=on_progress,
+        )
         leads = deduplicate_leads([
             extract_lead(item, city=city, state=state, category=category)
             for item in raw_results
@@ -427,20 +432,38 @@ class AivioIntegration:
         self,
         quantity: int,
         filters: dict[str, Any],
+        *,
+        on_progress: Callable[[dict[str, Any]], None] | None = None,
     ) -> tuple[list[dict[str, Any]], list[str]]:
-        before = self.browser_controller.capture_page_state()
+        if on_progress is not None:
+            on_progress({"phase": "searching", "page": 1})
+        before = self.browser_controller.capture_search_results_state()
         self._click_search_button()
-        self.browser_controller.wait_for_page_change(before, timeout_ms=20_000)
+        page_state = self.browser_controller.wait_for_stable_search_results(
+            before,
+            timeout_ms=20_000,
+        )
         results: list[dict[str, Any]] = []
         warnings: list[str] = []
         seen_pages: set[str] = set()
         visited_pages = 0
         while visited_pages < 100:
+            if on_progress is not None:
+                on_progress({
+                    "phase": "results_ready",
+                    "page": visited_pages + 1,
+                    "record_count": page_state["record_count"],
+                    "no_results": page_state["no_results"],
+                })
             semantic_records = self.browser_controller.read_semantic_records()
             if not isinstance(semantic_records, list) or any(
                 not isinstance(item, dict) for item in semantic_records
             ):
                 raise RuntimeError("A leitura dos resultados AIVIO retornou um formato inválido")
+            if not semantic_records and page_state["no_results"]:
+                break
+            if not semantic_records:
+                raise RuntimeError("A página indicou resultados, mas nenhum registro semântico foi lido")
             current = [self._record_to_search_result(item) for item in semantic_records]
             signature = hashlib.sha256(
                 json.dumps(current, sort_keys=True, ensure_ascii=False).encode("utf-8")
@@ -460,9 +483,18 @@ class AivioIntegration:
             next_button = self._next_page_button()
             if next_button is None:
                 break
-            before = self.browser_controller.capture_page_state()
+            if on_progress is not None:
+                on_progress({
+                    "phase": "next_page",
+                    "page": visited_pages + 1,
+                    "records_collected": len(results),
+                })
+            before = self.browser_controller.capture_search_results_state()
             self.browser_controller.click_button(text=next_button)
-            self.browser_controller.wait_for_page_change(before, timeout_ms=20_000)
+            page_state = self.browser_controller.wait_for_stable_search_results(
+                before,
+                timeout_ms=20_000,
+            )
         else:
             warnings.append("Limite de 100 páginas atingido.")
         return results, warnings
