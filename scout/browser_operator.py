@@ -6,8 +6,9 @@ import re
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from copy import deepcopy
-from typing import Any, Callable
+from typing import Any, Callable, cast
 from urllib.parse import urlsplit
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -16,9 +17,18 @@ from scout.browser_controller import (
     BrowserController,
     V2_CDP_ENDPOINT,
 )
+from scout.lead_normalization import deduplicate_leads, extract_lead
+from scout.storage import V2StateStore
+from scout.task_executor import _browser_execution_lock
+from scout.v2_delivery import build_operator_result_package, evaluate_lead_criteria
+from scout.v2_models import V2Lead
 _MEMORY_NAME_PATTERN = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}")
 
 logger = logging.getLogger("scout.browser_operator")
+
+
+class HumanInterventionRequired(RuntimeError):
+    pass
 
 _TARGET_FIELDS = {
     "role",
@@ -37,11 +47,14 @@ _ACTION_FIELDS = {
     "observe": set(),
     "click": {"target", "timeout_ms"},
     "fill": {"target", "value", "timeout_ms"},
+    "search": {"query", "target", "submit_target", "timeout_ms"},
     "select": {"target", "option", "timeout_ms"},
     "press": {"key"},
     "scroll": {"target", "delta_x", "delta_y"},
     "wait": {"target", "text", "url", "load_state", "timeout_ms"},
+    "wait_stable": {"timeout_ms", "stable_ms"},
     "read_text": {"target", "max_chars"},
+    "read_records": {"max_items"},
     "open_tab": {"url", "timeout_ms"},
     "switch_tab": {"title", "url"},
     "close_tab": {"title", "url"},
@@ -159,7 +172,7 @@ class V2BrowserController(BrowserController):
             page = self.getActivePage()
             if page is None:
                 raise RuntimeError("Não há uma aba ativa disponível")
-            return [("role", page.get_by_role(role))]
+            return [("role", page.get_by_role(cast(Any, role)))]
         if accessible_name and not any((
             role,
             text,
@@ -272,7 +285,7 @@ class V2BrowserController(BrowserController):
         page = self.getActivePage()
         if page is None:
             raise RuntimeError("Não há uma aba ativa disponível")
-        page.wait_for_load_state(load_state, timeout=timeout_ms)
+        page.wait_for_load_state(cast(Any, load_state), timeout=timeout_ms)
         return load_state
 
     @staticmethod
@@ -345,14 +358,23 @@ class V2BrowserController(BrowserController):
 class BrowserOperator:
     """Execute an explicit, bounded sequence of browser actions supplied by AUREN."""
 
-    def __init__(self, controller: V2BrowserController | None = None) -> None:
+    def __init__(
+        self,
+        controller: V2BrowserController | None = None,
+        on_action: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
         self.controller = controller or V2BrowserController()
+        self.on_action = on_action
 
     @staticmethod
     def validate_task(task: Any) -> dict[str, Any]:
         if not isinstance(task, dict):
             raise ValueError("task deve ser um objeto JSON")
-        unsupported = set(task) - {"task_id", "actions", "memory"}
+        unsupported = set(task) - {
+            "task_id", "goal", "query", "quantity", "niche", "locality",
+            "inclusion_criteria", "exclusion_criteria", "fields_of_interest",
+            "start_url", "actions", "memory",
+        }
         if unsupported:
             raise ValueError(f"task contém campos não suportados: {', '.join(sorted(unsupported))}")
         task_id = task.get("task_id")
@@ -362,6 +384,9 @@ class BrowserOperator:
             task_id = str(uuid.UUID(task_id))
         except ValueError as error:
             raise ValueError("task_id deve ser um UUID válido") from error
+        goal = task.get("goal", "")
+        if not isinstance(goal, str) or len(goal) > 500:
+            raise ValueError("goal deve ser texto com até 500 caracteres")
         memory = task.get("memory")
         if memory is not None:
             if (
@@ -376,7 +401,81 @@ class BrowserOperator:
                     f"memory.{memory_operation} deve ter 1 a 64 caracteres "
                     "alfanuméricos, ponto, hífen ou sublinhado"
                 )
-        actions = task.get("actions")
+        research: dict[str, Any] | None = None
+        actions: Any = None
+        query = task.get("query")
+        if query is not None:
+            if not _nonempty_text(query) or len(query) > 500:
+                raise ValueError("query deve ser texto não vazio com até 500 caracteres")
+            if "actions" in task or memory is not None:
+                raise ValueError("query declarativa não pode ser combinada com actions ou memory")
+            quantity = task.get("quantity", 10)
+            if isinstance(quantity, bool) or not isinstance(quantity, int) or not 1 <= quantity <= 10:
+                raise ValueError("quantity deve ser um inteiro entre 1 e 10")
+            criteria: dict[str, list[str]] = {}
+            for name in ("inclusion_criteria", "exclusion_criteria"):
+                values = task.get(name, [])
+                if (
+                    not isinstance(values, list)
+                    or len(values) > 20
+                    or any(not _nonempty_text(item) or len(item) > 300 for item in values)
+                ):
+                    raise ValueError(f"{name} deve ser uma lista de até 20 textos não vazios")
+                criteria[name] = list(dict.fromkeys(item.strip() for item in values))
+            allowed_fields = {
+                "company_name", "phone", "address", "website", "instagram", "source_url",
+                "company_url", "city", "state", "category", "has_website",
+            }
+            fields = task.get("fields_of_interest", [
+                "company_name", "phone", "address", "website", "instagram", "source_url",
+            ])
+            if (
+                not isinstance(fields, list)
+                or not fields
+                or len(fields) > len(allowed_fields)
+                or any(field not in allowed_fields for field in fields)
+            ):
+                raise ValueError("fields_of_interest contém campos inválidos")
+            niche = task.get("niche", "")
+            locality = task.get("locality", "")
+            start_url = task.get("start_url", "")
+            if not isinstance(niche, str) or len(niche) > 200:
+                raise ValueError("niche deve ser texto com até 200 caracteres")
+            if not isinstance(locality, str) or len(locality) > 300:
+                raise ValueError("locality deve ser texto com até 300 caracteres")
+            if not isinstance(start_url, str) or len(start_url) > 2_000:
+                raise ValueError("start_url deve ser texto com até 2000 caracteres")
+            if start_url.strip():
+                try:
+                    source_url = urlsplit(start_url.strip())
+                    valid_source = (
+                        source_url.scheme in {"http", "https"}
+                        and bool(source_url.hostname)
+                        and source_url.username is None
+                        and source_url.password is None
+                        and source_url.port != 0
+                    )
+                except ValueError:
+                    valid_source = False
+                if not valid_source:
+                    raise ValueError("start_url deve ser HTTP(S), público e sem credenciais")
+            research = {
+                "query": query.strip(),
+                "quantity": quantity,
+                "inclusion_criteria": criteria["inclusion_criteria"],
+                "exclusion_criteria": criteria["exclusion_criteria"],
+                "fields_of_interest": list(dict.fromkeys(fields)),
+                "niche": niche.strip(),
+                "locality": locality.strip(),
+                "start_url": start_url.strip(),
+            }
+            actions = ([{"action": "navigate", "url": start_url.strip(), "timeout_ms": 20_000}]
+                if start_url.strip() else []) + [
+                {"action": "search", "query": query.strip(), "timeout_ms": 20_000},
+                {"action": "read_records", "max_items": quantity},
+            ]
+        else:
+            actions = task.get("actions")
         if memory and "reuse" in memory:
             if "actions" in task:
                 raise ValueError("actions não pode ser informado junto com memory.reuse")
@@ -409,16 +508,41 @@ class BrowserOperator:
             target = action.get("target")
             if target is not None:
                 BrowserOperator._validate_target(target, index)
+            submit_target = action.get("submit_target")
+            if submit_target is not None:
+                BrowserOperator._validate_target(submit_target, index)
             if action_name in {"click", "fill", "select"} and target is None:
                 raise ValueError(f"actions[{index}].target é obrigatório")
             if action_name == "fill" and not isinstance(action.get("value"), str):
                 raise ValueError(f"actions[{index}].value deve ser texto")
+            if action_name == "search" and (
+                not _nonempty_text(action.get("query"))
+                or len(action["query"]) > 500
+            ):
+                raise ValueError(f"actions[{index}].query deve ter até 500 caracteres")
+            if action_name == "read_records" and (
+                isinstance(action.get("max_items", 200), bool)
+                or not isinstance(action.get("max_items", 200), int)
+                or not 1 <= action.get("max_items", 200) <= 1_000
+            ):
+                raise ValueError(f"actions[{index}].max_items deve estar entre 1 e 1000")
             if action_name == "read_text" and (
                 isinstance(action.get("max_chars"), bool)
                 or not isinstance(action.get("max_chars", 12_000), int)
                 or action.get("max_chars", 12_000) < 0
             ):
                 raise ValueError(f"actions[{index}].max_chars deve ser um inteiro não negativo")
+            if action_name == "wait_stable":
+                stable_ms = action.get("stable_ms", 750)
+                if (
+                    isinstance(stable_ms, bool)
+                    or not isinstance(stable_ms, int)
+                    or stable_ms < 1
+                    or stable_ms > timeout
+                ):
+                    raise ValueError(
+                        f"actions[{index}].stable_ms deve ser positivo e não superar timeout_ms"
+                    )
             if action_name == "select" and not _nonempty_text(action.get("option")):
                 raise ValueError(f"actions[{index}].option deve ser texto não vazio")
             if action_name in {"navigate", "open_tab"} and not _nonempty_text(action.get("url")):
@@ -514,6 +638,8 @@ class BrowserOperator:
                     raise ValueError(f"actions[{index}].url deve ser texto não vazio")
         return {
             "task_id": task_id,
+            **({"goal": goal.strip()} if goal.strip() else {}),
+            **({"research": research} if research is not None else {}),
             **({"actions": actions} if not memory or "reuse" not in memory else {}),
             **({"memory": memory} if memory is not None else {}),
         }
@@ -593,6 +719,8 @@ class BrowserOperator:
                     record["target"] = self._safe_target(action["target"])
                 records.append(record)
                 evidence.append(record["evidence"])
+                if self.on_action is not None:
+                    self.on_action(deepcopy(record))
                 if action["action"] not in {"observe", "read_text", "wait", "verify"}:
                     transition_baseline = before
                 elif action["action"] == "verify":
@@ -600,7 +728,9 @@ class BrowserOperator:
         except Exception as error:
             code = "operation_timeout" if isinstance(
                 error, (PlaywrightTimeoutError, TimeoutError)
-            ) else "operation_failed"
+            ) else "human_intervention_required" if isinstance(
+                error, HumanInterventionRequired
+            ) or (isinstance(error, ValueError) and "ambíguo" in str(error).casefold()) else "operation_failed"
             failed = {"code": code, "message": self._safe_error(error, action if "action" in locals() else {})}
             logger.error(
                 "Operação web V2 falhou task_id=%s action=%s error=%s",
@@ -615,6 +745,8 @@ class BrowserOperator:
                     "status": "failed",
                     "error": failed,
                 })
+                if self.on_action is not None:
+                    self.on_action(deepcopy(records[-1]))
         finally:
             try:
                 self.controller.disconnect()
@@ -630,7 +762,8 @@ class BrowserOperator:
                 else:
                     failed["cleanup_error"] = cleanup_error
 
-        status = "failed" if not records or (failed and not any(
+        needs_human = failed is not None and failed.get("code") == "human_intervention_required"
+        status = "needs_human" if needs_human else "failed" if not records or (failed and not any(
             record["status"] == "completed" for record in records
         )) else "partial" if failed else "completed"
         output: dict[str, Any] = {
@@ -682,14 +815,14 @@ class BrowserOperator:
         if name == "observe":
             return self.controller.inspectPage()
         if name == "click":
-            self._require_target(target)
+            target = self._require_target(target)
             self.controller.wait_for_semantic_target(timeout_ms=timeout, **target)
             found = self.controller.find_element(**target)
             if not found["found"]:
                 raise RuntimeError("Elemento não encontrado para clique")
             return self.controller.click_element(timeout_ms=timeout, **target)
         if name == "fill":
-            self._require_target(target)
+            target = self._require_target(target)
             self.controller.wait_for_semantic_target(timeout_ms=timeout, **target)
             found = self.controller.find_element(**target)
             if not found["found"]:
@@ -702,8 +835,10 @@ class BrowserOperator:
             return self.controller.fill_semantic_input(
                 action["value"], timeout_ms=timeout, **target
             )
+        if name == "search":
+            return self._search(action, timeout)
         if name == "select":
-            self._require_target(target)
+            target = self._require_target(target)
             self._assert_action_text_allowed(action["option"])
             self.controller.wait_for_semantic_target(timeout_ms=timeout, **target)
             found = self.controller.find_element(**target)
@@ -723,7 +858,7 @@ class BrowserOperator:
             self.controller.press_operator_key(key)
             return {"pressed": key}
         if name == "scroll":
-            target = target or {}
+            target = target if target is not None else {}
             delta_x = action.get("delta_x", 0)
             delta_y = action.get("delta_y", 0)
             for value in (delta_x, delta_y):
@@ -746,7 +881,7 @@ class BrowserOperator:
                 return {"waited_for": "text"}
             if "load_state" in action:
                 state = self.controller.wait_for_load_state(
-                    action["load_state"], timeout_ms=timeout
+                    cast(Any, action["load_state"]), timeout_ms=timeout
                 )
                 return {"waited_for": "load_state", "state": state}
             return {
@@ -754,6 +889,12 @@ class BrowserOperator:
                     self.controller.wait_for_url(action["url"], timeout_ms=timeout)
                 )
             }
+        if name == "wait_stable":
+            return self.controller.wait_for_stable_content(
+                before["state"],
+                timeout_ms=timeout,
+                stable_ms=action.get("stable_ms", 750),
+            )
         if name == "read_text":
             if target is None:
                 return {"text": self.controller.read_visible_text(action.get("max_chars", 12_000))}
@@ -761,6 +902,16 @@ class BrowserOperator:
             if not found["found"]:
                 raise RuntimeError("Elemento não encontrado para leitura")
             return {"text": found["element"]["text"]}
+        if name == "read_records":
+            records = self.controller.read_semantic_records(action.get("max_items", 200))
+            page = self.controller.getActivePage()
+            if page is None:
+                raise RuntimeError("Não há uma aba ativa para identificar a origem dos records")
+            return {
+                "count": len(records),
+                "records": records,
+                "source_url": self.controller._safe_page_url(page.url),
+            }
         if name == "open_tab":
             return self.controller.open_new_tab(action["url"], timeout_ms=timeout)
         if name == "switch_tab":
@@ -776,6 +927,99 @@ class BrowserOperator:
                 timeout,
             )
         raise ValueError(f"Ação não suportada: {name}")
+
+    def _search(self, action: dict[str, Any], timeout_ms: int) -> dict[str, Any]:
+        inspection = self.controller.inspectPage()
+        inputs = inspection.get("inputs", [])
+        target = action.get("target")
+        field_info: dict[str, Any] | None = None
+        if target is None:
+            candidates = [
+                item for item in inputs
+                if isinstance(item, dict)
+                and (
+                    item.get("type") == "search"
+                    or re.search(
+                        r"search|pesquis|buscar|consulta|find",
+                        " ".join(str(value) for value in (
+                            item.get("name"), item.get("id"), item.get("aria_label"),
+                            item.get("placeholder"), *(item.get("labels") or []),
+                        )),
+                        re.I,
+                    )
+                )
+            ]
+            if len(candidates) != 1:
+                raise HumanInterventionRequired(
+                    f"Esperava um único campo de busca semântico; encontrados {len(candidates)}"
+                )
+            field_info = candidates[0]
+            target = self._input_target(field_info)
+        found = self.controller.find_element(**target)
+        if not found.get("found"):
+            raise RuntimeError("Campo de busca não encontrado")
+        if field_info is None and isinstance(found.get("element"), dict):
+            field_info = found["element"]
+        self.controller.wait_for_semantic_target(timeout_ms=timeout_ms, **target)
+        before = self.controller.capture_page_state()
+        self.controller.fill_semantic_input(action["query"], timeout_ms=timeout_ms, **target)
+
+        submit_target = action.get("submit_target")
+        submit_label: str | None = None
+        if submit_target is None:
+            buttons = inspection.get("buttons", [])
+            matches = [
+                item for item in buttons
+                if isinstance(item, dict)
+                and not item.get("disabled")
+                and re.fullmatch(
+                    r"\s*(search|pesquisar|buscar|find|go)\s*",
+                    item.get("text") or item.get("aria_label") or "",
+                    re.I,
+                )
+            ]
+            labels = list(dict.fromkeys(
+                (item.get("text") or item.get("aria_label") or "").strip()
+                for item in matches
+            ))
+            if len(labels) > 1:
+                raise HumanInterventionRequired("Botão de busca ambíguo")
+            if labels:
+                submit_label = labels[0]
+                submit_target = {"role": "button", "accessible_name": submit_label}
+
+        if submit_target is not None:
+            self.controller.wait_for_semantic_target(timeout_ms=timeout_ms, **submit_target)
+            self.controller.click_element(timeout_ms=timeout_ms, **submit_target)
+        elif field_info is not None and field_info.get("type") == "search":
+            field = self.controller._find_target(**target)
+            field.focus()
+            self.controller.press_operator_key("Enter")
+            submit_label = "Enter"
+        else:
+            raise HumanInterventionRequired("Nenhum controle de envio da busca foi identificado")
+
+        stable = self.controller.wait_for_stable_content(before, timeout_ms=timeout_ms)
+        return {
+            "query": action["query"],
+            "search_field": self._safe_target(target),
+            "submitted_by": self._safe_target(submit_target) if submit_target else submit_label,
+            "stable_content": stable,
+        }
+
+    @staticmethod
+    def _input_target(item: dict[str, Any]) -> dict[str, Any]:
+        aria_label = item.get("aria_label")
+        if isinstance(aria_label, str) and aria_label.strip():
+            return {"aria_label": aria_label.strip()}
+        labels = item.get("labels")
+        if isinstance(labels, list) and len(labels) == 1 and isinstance(labels[0], str):
+            return {"label": labels[0]}
+        for key in ("placeholder", "name", "element_id"):
+            value = item.get("id") if key == "element_id" else item.get(key)
+            if isinstance(value, str) and value.strip():
+                return {key: value.strip()}
+        raise RuntimeError("Campo de busca sem critério acessível estável")
 
     def _verify(self, action: dict[str, Any], before: dict[str, Any], timeout: int) -> dict[str, Any]:
         if "target" in action:
@@ -810,9 +1054,10 @@ class BrowserOperator:
         raise ValueError("state deve ser page_changed quando target, text e url não forem informados")
 
     @staticmethod
-    def _require_target(target: Any) -> None:
+    def _require_target(target: Any) -> dict[str, Any]:
         if not isinstance(target, dict) or not target:
             raise ValueError("target deve ser um objeto não vazio")
+        return target
 
     @staticmethod
     def _fill_input_target(target: dict[str, Any]) -> dict[str, Any] | None:
@@ -920,12 +1165,67 @@ class BrowserOperatorExecutor:
     def __init__(
         self,
         controller_factory: Callable[[], V2BrowserController] = V2BrowserController,
+        state_store: V2StateStore | None = None,
     ) -> None:
         self._controller_factory = controller_factory
         self._lock = threading.RLock()
         self._results: dict[str, dict[str, Any]] = {}
         self._memory: dict[str, dict[str, Any]] = {}
         self._execution_lock = threading.Lock()
+        self.state_store = state_store or V2StateStore()
+        for task_id, record in self.state_store.load_operator_tasks().items():
+            result = record.get("result")
+            if not isinstance(result, dict):
+                result = {
+                    "task_id": task_id,
+                    "status": record.get("status", "failed"),
+                    "action": record.get("action"),
+                    "result": record.get("results"),
+                    "evidence": record.get("evidence", []),
+                    "operations": record.get("operations", []),
+                    "progress": record.get("progress", {}),
+                }
+            if record.get("status") in {"queued", "running"} and not self._process_is_alive(
+                record.get("worker_pid")
+            ):
+                result = {
+                    **result,
+                    "status": "failed",
+                    "operations": deepcopy(record.get("operations", [])),
+                    "evidence": deepcopy(record.get("evidence", [])),
+                    "started_at": record.get("started_at"),
+                    "finished_at": datetime.now(timezone.utc).isoformat(),
+                    "error": {
+                        "code": "task_interrupted",
+                        "message": "Tarefa interrompida; não foi repetida automaticamente",
+                    },
+                }
+                if record.get("research") is not None:
+                    result["research"] = deepcopy(record["research"])
+                    action_results = [
+                        item.get("result") for item in result["operations"]
+                        if item.get("status") == "completed"
+                    ]
+                    result["result"] = action_results
+                    self._finalize_research(result, result["research"])
+                package_task = {
+                    "task_id": task_id,
+                    "goal": record.get("goal", ""),
+                    "actions": record.get("actions", []),
+                    **({"research": record["research"]} if record.get("research") is not None else {}),
+                }
+                package = build_operator_result_package(package_task, result)
+                self.state_store.save_result_package(task_id, package)
+                result["result_package"] = package
+                result["data"] = {"package_id": package["package_id"]}
+                record.update({
+                    "status": "failed",
+                    "result": result,
+                    "result_package": package,
+                    "finished_at": datetime.now(timezone.utc).isoformat(),
+                })
+                self.state_store.save_operator_task(task_id, record)
+            self._results[task_id] = deepcopy(result)
 
     def execute(self, task: Any) -> dict[str, Any]:
         try:
@@ -940,9 +1240,28 @@ class BrowserOperatorExecutor:
                 "error": {"code": "invalid_task", "message": str(error)},
             }
         task_id = validated["task_id"]
-        with self._execution_lock:
+        with self._execution_lock, _browser_execution_lock(V2_CDP_ENDPOINT):
             with self._lock:
-                if task_id in self._results:
+                now = datetime.now(timezone.utc).isoformat()
+                record = {
+                    "task_id": task_id,
+                    "type": "BROWSER_OPERATOR",
+                    "goal": validated.get("goal", ""),
+                    "research": deepcopy(validated.get("research")),
+                    "status": "queued",
+                    "actions": deepcopy(validated.get("actions", [])),
+                    "operations": [],
+                    "evidence": [],
+                    "progress": {"completed_actions": 0, "total_actions": len(validated.get("actions", []))},
+                    "result": None,
+                    "worker_pid": os.getpid(),
+                    "created_at": now,
+                    "started_at": None,
+                    "finished_at": None,
+                }
+                if task_id in self._results or not self.state_store.create_operator_task(
+                    task_id, record
+                ):
                     return {
                         "task_id": task_id,
                         "status": "failed",
@@ -959,24 +1278,83 @@ class BrowserOperatorExecutor:
                     memory_name = memory["reuse"]
                     remembered = self._memory.get(memory_name)
                     if remembered is None:
-                        return {
+                        result = {
                             "task_id": task_id,
                             "status": "failed",
                             "action": None,
                             "result": None,
                             "evidence": [],
+                            "operations": [],
                             "error": {
                                 "code": "memory_not_found",
                                 "message": f"Não existe procedimento operacional salvo: {memory_name}",
                             },
                         }
+                        result["started_at"] = record["created_at"]
+                        result["finished_at"] = datetime.now(timezone.utc).isoformat()
+                        result["result_package"] = build_operator_result_package(
+                            {**validated, "actions": []}, result,
+                        )
+                        result["data"] = {"package_id": result["result_package"]["package_id"]}
+                        self.state_store.save_result_package(task_id, result["result_package"])
+                        record.update({
+                            "status": "failed",
+                            "result": deepcopy(result),
+                            "finished_at": result["finished_at"],
+                        })
+                        self.state_store.save_operator_task(task_id, record)
+                        self._results[task_id] = deepcopy(result)
+                        return result
                     actions = deepcopy(remembered["actions"])
                 else:
                     actions = deepcopy(validated["actions"])
-            result = BrowserOperator(self._controller_factory()).execute({
-                "task_id": task_id,
-                "actions": actions,
-            })
+                    record["actions"] = deepcopy(actions)
+                record.update({
+                    "status": "running",
+                    "started_at": datetime.now(timezone.utc).isoformat(),
+                })
+                self.state_store.save_operator_task(task_id, record)
+
+            def persist_action(action_record: dict[str, Any]) -> None:
+                record["operations"].append(deepcopy(action_record))
+                if isinstance(action_record.get("evidence"), dict):
+                    record["evidence"].append(deepcopy(action_record["evidence"]))
+                record["action"] = {
+                    "index": action_record.get("index"),
+                    "name": action_record.get("action"),
+                }
+                record["progress"] = {
+                    "completed_actions": sum(
+                        item.get("status") == "completed" for item in record["operations"]
+                    ),
+                    "total_actions": len(actions),
+                }
+                self.state_store.save_operator_task(task_id, record)
+
+            try:
+                result = BrowserOperator(
+                    self._controller_factory(),
+                    on_action=persist_action,
+                ).execute({
+                    "task_id": task_id,
+                    "goal": validated.get("goal", ""),
+                    "actions": actions,
+                })
+            except Exception as error:
+                result = {
+                    "task_id": task_id,
+                    "status": "failed",
+                    "action": record.get("action"),
+                    "result": [],
+                    "evidence": deepcopy(record.get("evidence", [])),
+                    "operations": deepcopy(record.get("operations", [])),
+                    "error": {
+                        "code": "operation_failed",
+                        "message": BrowserOperator._safe_error(error, {}),
+                    },
+                }
+            if validated.get("research") is not None:
+                self._finalize_research(result, validated["research"])
             if (
                 result.get("status") == "completed"
                 and memory
@@ -991,14 +1369,140 @@ class BrowserOperatorExecutor:
                 result["memory"] = {"saved_as": memory_name}
             elif result.get("status") == "completed" and memory and "reuse" in memory:
                 result["memory"] = {"reused": memory["reuse"]}
+            result["started_at"] = record["started_at"]
+            result["finished_at"] = datetime.now(timezone.utc).isoformat()
+            package_task = {**validated, "actions": deepcopy(actions)}
+            result["result_package"] = build_operator_result_package(package_task, result)
+            result["data"] = {"package_id": result["result_package"]["package_id"]}
+            self.state_store.save_result_package(task_id, result["result_package"])
             with self._lock:
                 self._results[task_id] = deepcopy(result)
+                record.update({
+                    "status": result.get("status", "failed"),
+                    "result": deepcopy(result),
+                    "action": deepcopy(result.get("action")),
+                    "operations": deepcopy(result.get("operations", [])),
+                    "evidence": deepcopy(result.get("evidence", [])),
+                    "progress": {
+                        "completed_actions": sum(
+                            item.get("status") == "completed"
+                            for item in result.get("operations", [])
+                        ),
+                        "total_actions": len(actions),
+                    },
+                    "started_at": record.get("started_at") or record["created_at"],
+                    "finished_at": datetime.now(timezone.utc).isoformat(),
+                })
+                result["progress"] = deepcopy(record["progress"])
+                record["result"] = deepcopy(result)
+                self._results[task_id] = deepcopy(result)
+                self.state_store.save_operator_task(task_id, record)
         return result
 
     def get_result(self, task_id: str) -> dict[str, Any] | None:
         with self._lock:
-            result = self._results.get(task_id)
+            persisted = self.state_store.get_operator_task(task_id)
+            result = persisted.get("result") if isinstance(persisted, dict) else None
+            if not isinstance(result, dict):
+                result = self._results.get(task_id)
             return deepcopy(result) if result is not None else None
+
+    def _finalize_research(self, result: dict[str, Any], research: dict[str, Any]) -> None:
+        action_results = result.get("result", [])
+        records: list[dict[str, Any]] = []
+        for item in action_results if isinstance(action_results, list) else []:
+            if isinstance(item, dict) and isinstance(item.get("records"), list):
+                records = [record for record in item["records"] if isinstance(record, dict)]
+                break
+        leads: list[V2Lead] = []
+        excluded: list[dict[str, Any]] = []
+        warnings: list[str] = []
+        for record in records:
+            source_url = record.get("source_url")
+            raw_links = record.get("links", [])
+            links = [
+                {"title": item.get("text", ""), "url": item.get("url")}
+                for item in raw_links if isinstance(item, dict) and isinstance(item.get("url"), str)
+            ] if isinstance(raw_links, list) else []
+            source_host = urlsplit(source_url).hostname if isinstance(source_url, str) else None
+            company_link = next((
+                item["url"] for item in links
+                if source_host and urlsplit(item["url"]).hostname == source_host
+            ), None)
+            lead = extract_lead({
+                "title": record.get("title"),
+                "text": record.get("text", ""),
+                "url": company_link,
+                "links": links,
+            }, category=research.get("niche") or None)
+            lead.source = source_host or "browser"
+            lead.source_url = source_url if isinstance(source_url, str) else None
+            lead.company_url = company_link
+            criteria = evaluate_lead_criteria(
+                " ".join((lead.company_name, record.get("text", ""))),
+                research["inclusion_criteria"],
+                research["exclusion_criteria"],
+            )
+            if criteria["status"] == "excluded":
+                excluded.append(lead.to_dict())
+            else:
+                leads.append(lead)
+                if criteria["criteria_unverified"]:
+                    warnings.append(
+                        f"Critérios de inclusão sem evidência em: {lead.company_name or 'resultado sem nome'}"
+                    )
+        known_leads = [
+            V2Lead.from_dict(item) for item in self.state_store.load_leads()
+        ]
+        known_ids = {lead.lead_id for lead in known_leads}
+        deduplicated = deduplicate_leads(known_leads + leads)
+        duplicate_count = max(0, len(known_leads) + len(leads) - len(deduplicated))
+        self.state_store.replace_leads([lead.to_dict() for lead in deduplicated])
+        selected = [
+            lead for lead in deduplicated if lead.lead_id not in known_ids
+        ][:research["quantity"]]
+        duplicate_records = []
+        for lead in deduplicated:
+            for duplicate in lead.raw_data.get("duplicates", []):
+                if isinstance(duplicate, dict):
+                    search_result = duplicate.get("search_result", {})
+                    if not isinstance(search_result, dict):
+                        search_result = {}
+                    duplicate_records.append({
+                        "company_name": search_result.get("title"),
+                        "source_url": search_result.get("source_url"),
+                        "deduplicated_to": lead.lead_id,
+                    })
+        if excluded:
+            warnings.append(f"{len(excluded)} resultado(s) separados por critérios de exclusão.")
+        if duplicate_count:
+            warnings.append(f"{duplicate_count} duplicata(s) foram eliminadas.")
+        if len(selected) < research["quantity"]:
+            result["status"] = "partial"
+        result["leads"] = [lead.to_dict() for lead in selected]
+        result["research"] = {
+            **research,
+            "found_count": len(selected),
+            "excluded_results": excluded,
+            "duplicates_skipped": duplicate_count,
+            "duplicates": duplicate_records,
+            "unique_total": len(deduplicated),
+            "warnings": warnings,
+        }
+        if warnings:
+            result.setdefault("warnings", []).extend(warnings)
+
+    @staticmethod
+    def _process_is_alive(process_id: Any) -> bool:
+        if isinstance(process_id, bool) or not isinstance(process_id, int) or process_id < 1:
+            return False
+        try:
+            os.kill(process_id, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
 
 
 def _nonempty_text(value: Any) -> bool:

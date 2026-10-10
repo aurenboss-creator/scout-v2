@@ -19,6 +19,7 @@ from scout.lead_normalization import (
 )
 from scout.storage import V2StateStore
 from scout.task_executor import TaskExecutor, _browser_execution_lock
+from scout.v2_delivery import build_result_package, evaluate_lead_criteria, validate_result_package
 from scout.v2_models import SearchLeadsPayload, Task, TaskResult, TaskStatus, TaskType, V2Lead
 
 
@@ -57,7 +58,11 @@ class FakeIntegration:
             "category": kwargs["category"],
             "requested_quantity": kwargs["quantity"],
             "results": [V2Lead(company_name="Restaurante Exemplo", city=kwargs["city"],
-                               state=kwargs["state"], category=kwargs["category"]).to_dict()],
+                               state=kwargs["state"], category=kwargs["category"],
+                               raw_data={"search_result": {
+                                   "title": "Restaurante Exemplo",
+                                   "url": "https://app.aivio.example/company/123",
+                               }}).to_dict()],
             "warnings": [],
         }
 
@@ -112,6 +117,16 @@ class TaskContractTests(unittest.TestCase):
             "city": "Porto Alegre", "state": "RS", "category": "restaurantes",
         }, authorization={"allow_credit_consumption": True, "authorized_by": "auren"}))
         self.assertEqual(default_quantity_task.payload.quantity, 10)
+        detailed_task = Task.from_dict(task_request("SEARCH_LEADS", {
+            "city": "Porto Alegre", "state": "RS", "category": "restaurantes",
+            "objective": "Encontrar restaurantes sem site",
+            "inclusion_criteria": ["atende no salão"],
+            "exclusion_criteria": ["rede nacional"],
+            "fields_of_interest": ["company_name", "website"],
+        }, authorization={"allow_credit_consumption": True, "authorized_by": "auren"}))
+        self.assertEqual(detailed_task.payload.objective, "Encontrar restaurantes sem site")
+        self.assertEqual(detailed_task.payload.inclusion_criteria, ["atende no salão"])
+        self.assertEqual(detailed_task.payload.fields_of_interest, ["company_name", "website"])
         for quantity in (0, 11, 100, True):
             with self.subTest(quantity=quantity):
                 with self.assertRaisesRegex(ValueError, "entre 1 e 10"):
@@ -145,6 +160,47 @@ class TaskContractTests(unittest.TestCase):
         self.assertEqual(decoded.to_dict(), encoded)
         self.assertIsNone(encoded["has_website"])
         self.assertEqual(encoded["source"], "AIVIO")
+
+    def test_result_package_has_sources_missing_fields_and_human_summary(self):
+        task = Task.from_dict(task_request("SEARCH_LEADS", {
+            "city": "Porto Alegre", "state": "RS", "category": "restaurantes",
+        }, authorization={"allow_credit_consumption": True, "authorized_by": "auren"}))
+        lead = V2Lead(
+            company_name="Restaurante Observado",
+            city="Porto Alegre",
+            state="RS",
+            source_url="https://directory.example/place/1",
+            raw_data={"search_result": {"text": "Restaurante Observado"}},
+        )
+        result = TaskResult(
+            task_id=task.task_id,
+            type=TaskType.SEARCH_LEADS,
+            status=TaskStatus.PARTIAL,
+            leads=[lead],
+            started_at="2026-10-10T10:00:00+00:00",
+            finished_at="2026-10-10T10:01:00+00:00",
+        )
+
+        package = validate_result_package(build_result_package(task, result))
+
+        self.assertEqual(package["found_count"], 1)
+        self.assertEqual(package["results"][0]["evidence"][0]["source_url"], lead.source_url)
+        self.assertIn("phone", package["results"][0]["missing_or_unverified"])
+        self.assertIn("1/10", package["summary"])
+        self.assertEqual(package["delivery"]["status"], "pending")
+
+    def test_negated_text_does_not_satisfy_or_trigger_criteria(self):
+        result = evaluate_lead_criteria(
+            "a empresa não é franquia e não atende no salão",
+            ["atende no salão"],
+            ["franquia"],
+        )
+
+        self.assertEqual(result["status"], "unverified")
+        self.assertFalse(result["inclusion_evidence"][0]["matched"])
+        self.assertTrue(result["inclusion_evidence"][0]["negated"])
+        self.assertFalse(result["exclusion_evidence"][0]["matched"])
+        self.assertTrue(result["exclusion_evidence"][0]["negated"])
 
 
 class LeadNormalizationTests(unittest.TestCase):
@@ -212,6 +268,22 @@ class LeadNormalizationTests(unittest.TestCase):
         self.assertEqual(result[0].company_name, "Loja A")
         self.assertTrue(result[0].raw_data["duplicates"])
 
+    def test_shared_search_source_url_does_not_deduplicate_distinct_companies(self):
+        first = V2Lead(
+            company_name="Restaurante Um",
+            city="Porto Alegre",
+            source_url="https://directory.example/search",
+        )
+        second = V2Lead(
+            company_name="Restaurante Dois",
+            city="Porto Alegre",
+            source_url="https://directory.example/search",
+        )
+
+        result = deduplicate_leads([first, second])
+
+        self.assertEqual([lead.company_name for lead in result], ["Restaurante Um", "Restaurante Dois"])
+
 
 class V2StateStoreTests(unittest.TestCase):
     def test_task_records_and_leads_survive_store_reinitialization(self):
@@ -252,6 +324,47 @@ class V2StateStoreTests(unittest.TestCase):
             self.assertTrue(first.create_task_record("task-1", {"status": "queued"}))
             self.assertFalse(second.create_task_record("task-1", {"status": "queued"}))
 
+    def test_old_state_schema_is_read_without_losing_existing_v2_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "state.json")
+            legacy_task = {"task_id": "task-1", "status": "completed"}
+            with open(path, "w", encoding="utf-8") as state_file:
+                import json
+
+                json.dump({"tasks": {"task-1": legacy_task}, "leads": {}}, state_file)
+
+            store = V2StateStore(path)
+            store.save_result_package("task-1", {
+                "package_id": "package-1",
+                "delivery": {"status": "pending", "attempts": 0},
+            })
+            reopened = V2StateStore(path)
+
+            self.assertEqual(reopened.get_task_record("task-1"), legacy_task)
+            self.assertEqual(reopened.get_result_package("package-1")["package_id"], "package-1")
+
+    def test_operator_history_and_package_delivery_survive_reinitialization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "state.json")
+            first = V2StateStore(path)
+            record = {"task_id": "operator-1", "status": "completed", "operations": [{"action": "observe"}]}
+            package = {
+                "package_id": "package-1",
+                "delivery": {
+                    "status": "pending", "attempts": 0,
+                    "last_attempt_at": None, "delivered_at": None, "error": None,
+                },
+            }
+            self.assertTrue(first.create_operator_task("operator-1", record))
+            first.save_result_package("operator-1", package)
+            first.record_package_delivery("package-1", "failed", detail="Auren indisponível")
+
+            reopened = V2StateStore(path)
+
+            self.assertEqual(reopened.get_operator_task("operator-1"), record)
+            self.assertEqual(reopened.get_result_package("operator-1")["delivery"]["status"], "failed")
+            self.assertEqual(reopened.get_result_package("package-1")["delivery"]["attempts"], 1)
+
 
 class TaskExecutorTests(unittest.TestCase):
     def setUp(self):
@@ -279,6 +392,8 @@ class TaskExecutorTests(unittest.TestCase):
         self.assertTrue(result["finished_at"])
         self.assertEqual(result["errors"], [])
         self.assertEqual(result["result"]["leads"][0]["company_name"], "Restaurante Exemplo")
+        self.assertEqual(result["result_package"]["task_id"], request["task_id"])
+        self.assertEqual(result["data"]["package_id"], result["result_package"]["package_id"])
         self.assertIsNone(result["error"])
         self.assertTrue(self.integration.search_authorization)
 
@@ -294,16 +409,21 @@ class TaskExecutorTests(unittest.TestCase):
         )
 
         self.assertEqual(completed.status, TaskStatus.COMPLETED)
-        self.assertEqual(
-            restarted.get_task_result(request["task_id"])["progress"],
-            {"phase": "results_ready", "page": 1, "record_count": 1},
-        )
+        recovered_task = restarted.get_task_result(request["task_id"])
+        self.assertEqual(recovered_task["progress"]["phase"], "completed")
+        self.assertEqual(recovered_task["progress_events"][0]["phase"], "results_ready")
         self.assertEqual(len(restarted.state_store.load_leads()), 1)
+        package = restarted.get_result_package(request["task_id"])
+        self.assertEqual(package["task_id"], request["task_id"])
+        self.assertEqual(package["delivery"]["status"], "pending")
         with self.assertRaisesRegex(ValueError, "já foi executado"):
             restarted.execute(request)
 
     def test_interrupted_search_is_marked_failed_without_automatic_replay(self):
-        task_id = str(uuid.uuid4())
+        request = task_request("SEARCH_LEADS", {
+            "city": "Porto Alegre", "state": "RS", "category": "restaurantes",
+        }, authorization={"allow_credit_consumption": True, "authorized_by": "auren"})
+        task_id = request["task_id"]
         interrupted = TaskResult(
             task_id=task_id,
             type=TaskType.SEARCH_LEADS,
@@ -311,6 +431,7 @@ class TaskExecutorTests(unittest.TestCase):
             started_at="2026-10-09T00:00:00+00:00",
             finished_at="",
         ).to_dict()
+        interrupted["_task_request"] = request
         self.executor.state_store.save_task_record(task_id, interrupted)
 
         restarted = TaskExecutor(
@@ -321,6 +442,8 @@ class TaskExecutorTests(unittest.TestCase):
 
         self.assertEqual(recovered["status"], "failed")
         self.assertEqual(recovered["error"]["code"], "task_interrupted")
+        self.assertEqual(recovered["result_package"]["execution"]["status"], "failed")
+        self.assertEqual(recovered["result_package"]["found_count"], 0)
         self.assertIsNone(restarted.integration.search_authorization)
 
     def test_restart_does_not_mark_another_live_process_task_as_interrupted(self):
@@ -355,6 +478,57 @@ class TaskExecutorTests(unittest.TestCase):
         self.assertEqual(len(first_result.leads), 1)
         self.assertEqual(second_result.leads, [])
         self.assertEqual(len(self.executor.state_store.load_leads()), 1)
+        self.assertEqual(
+            second_result.result_package["duplicates"][0]["company_name"],
+            "Restaurante Exemplo",
+        )
+
+    def test_search_applies_only_observed_criteria_and_preserves_exclusions(self):
+        class CriteriaIntegration(FakeIntegration):
+            def search_leads(self, **kwargs):
+                self.search_authorization = kwargs.get("allow_credit_consumption")
+                return {
+                    "status": "completed",
+                    "city": kwargs["city"],
+                    "state": kwargs["state"],
+                    "category": kwargs["category"],
+                    "requested_quantity": kwargs["quantity"],
+                    "results": [
+                        V2Lead(
+                            company_name="Restaurante Local",
+                            city=kwargs["city"], state=kwargs["state"], category=kwargs["category"],
+                            source_url="https://directory.example/local",
+                            raw_data={"search_result": {"text": "Atende no salão"}},
+                        ).to_dict(),
+                        V2Lead(
+                            company_name="Rede Nacional",
+                            city=kwargs["city"], state=kwargs["state"], category=kwargs["category"],
+                            source_url="https://directory.example/chain",
+                            raw_data={"search_result": {"text": "Rede nacional"}},
+                        ).to_dict(),
+                    ],
+                    "warnings": [],
+                }
+
+        executor = TaskExecutor(
+            integration=CriteriaIntegration(),
+            state_store=V2StateStore(self.state_path),
+        )
+        request = task_request("SEARCH_LEADS", {
+            "city": "Porto Alegre",
+            "state": "RS",
+            "category": "restaurantes",
+            "quantity": 2,
+            "inclusion_criteria": ["Atende no salão"],
+            "exclusion_criteria": ["Rede nacional"],
+        }, authorization={"allow_credit_consumption": True, "authorized_by": "auren"})
+
+        result = executor.execute(request)
+
+        self.assertEqual([lead.company_name for lead in result.leads], ["Restaurante Local"])
+        package = result.result_package
+        self.assertEqual(package["results"][0]["qualification"]["status"], "qualified")
+        self.assertEqual(package["excluded_results"][0]["qualification"]["status"], "excluded")
 
     def test_v2_defaults_to_its_own_cdp_endpoint(self):
         with patch.dict("os.environ", {}, clear=True):

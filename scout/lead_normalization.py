@@ -284,8 +284,6 @@ def deduplicate_leads(leads: list[V2Lead]) -> list[V2Lead]:
             keys.append(("name_city", f"{name}|{city}"))
         if lead.company_url:
             keys.append(("company_url", lead.company_url.casefold()))
-        if lead.source_url:
-            keys.append(("source_url", lead.source_url.casefold()))
 
         duplicate_index = next((index[key] for key in keys if key in index), None)
         if duplicate_index is None:

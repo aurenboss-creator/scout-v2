@@ -117,6 +117,12 @@ class SearchLeadsPayload:
     category: str
     quantity: int = 10
     filters: dict[str, Any] = field(default_factory=dict)
+    objective: str = ""
+    inclusion_criteria: list[str] = field(default_factory=list)
+    exclusion_criteria: list[str] = field(default_factory=list)
+    fields_of_interest: list[str] = field(default_factory=lambda: [
+        "company_name", "phone", "address", "website", "instagram", "source_url",
+    ])
 
 
 @dataclass(slots=True)
@@ -229,12 +235,47 @@ class Task:
                 raise ValueError("payload.filters deve ser um objeto")
             if "has_website" in filters and not isinstance(filters["has_website"], bool):
                 raise ValueError("payload.filters.has_website deve ser booleano")
+            objective = payload.get("objective", "")
+            if not isinstance(objective, str) or len(objective) > 500:
+                raise ValueError("payload.objective deve ser texto com até 500 caracteres")
+            criteria = {}
+            for name in ("inclusion_criteria", "exclusion_criteria"):
+                values = payload.get(name, [])
+                if (
+                    not isinstance(values, list)
+                    or len(values) > 20
+                    or any(
+                        not isinstance(item, str) or not item.strip() or len(item) > 300
+                        for item in values
+                    )
+                ):
+                    raise ValueError(f"payload.{name} deve ser uma lista de até 20 textos não vazios")
+                criteria[name] = list(dict.fromkeys(item.strip() for item in values))
+            allowed_fields = {
+                "company_name", "phone", "address", "website", "instagram", "source_url",
+                "company_url", "city", "state", "category", "has_website",
+            }
+            fields_of_interest = payload.get(
+                "fields_of_interest",
+                ["company_name", "phone", "address", "website", "instagram", "source_url"],
+            )
+            if (
+                not isinstance(fields_of_interest, list)
+                or not fields_of_interest
+                or len(fields_of_interest) > len(allowed_fields)
+                or any(item not in allowed_fields for item in fields_of_interest)
+            ):
+                raise ValueError("payload.fields_of_interest contém campos inválidos")
             return SearchLeadsPayload(
                 city=payload["city"],
                 state=payload["state"],
                 category=payload["category"],
                 quantity=quantity,
                 filters=filters,
+                objective=objective.strip(),
+                inclusion_criteria=criteria["inclusion_criteria"],
+                exclusion_criteria=criteria["exclusion_criteria"],
+                fields_of_interest=list(dict.fromkeys(fields_of_interest)),
             )
         elif task_type in {TaskType.OPEN_COMPANY, TaskType.GENERATE_SITE}:
             if not isinstance(payload.get("lead"), dict):
@@ -257,6 +298,8 @@ class TaskResult:
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     progress: dict[str, Any] = field(default_factory=dict)
+    progress_events: list[dict[str, Any]] = field(default_factory=list)
+    result_package: dict[str, Any] | None = None
     worker_pid: int | None = None
     error: dict[str, str] | None = None
     started_at: str = field(default_factory=utc_now)
@@ -270,6 +313,8 @@ class TaskResult:
             "artifacts": self.artifacts,
             "warnings": self.warnings,
             "progress": self.progress,
+            "progress_events": self.progress_events,
+            "result_package": self.result_package,
             "worker_pid": self.worker_pid,
         }
         return {
@@ -284,6 +329,8 @@ class TaskResult:
             "errors": self.errors,
             "warnings": self.warnings,
             "progress": self.progress,
+            "progress_events": self.progress_events,
+            "result_package": self.result_package,
             "worker_pid": self.worker_pid,
             "started_at": self.started_at,
             "finished_at": self.finished_at,

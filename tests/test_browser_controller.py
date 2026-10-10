@@ -27,6 +27,10 @@ class FakePage:
         self.category_inspections = []
         self.search_result_states = []
         self.last_search_result_state = None
+        self.stable_content_states = []
+        self.stable_snapshots = []
+        self.last_stable_content_state = None
+        self.last_stable_snapshot = None
 
     def is_closed(self):
         return False
@@ -35,6 +39,14 @@ class FakePage:
         return self._title
 
     def evaluate(self, expression):
+        if "url: window.location.href" in expression and "text_hash: (() => {" in expression:
+            if self.stable_snapshots:
+                self.last_stable_snapshot = self.stable_snapshots.pop(0)
+            return self.last_stable_snapshot or {"url": self.url, "text_hash": "unchanged"}
+        if "text_length: text.length" in expression:
+            if self.stable_content_states:
+                self.last_stable_content_state = self.stable_content_states.pop(0)
+            return self.last_stable_content_state or {"text_length": 0, "loading": False}
         if expression == SEARCH_RESULT_STATE_SCRIPT:
             if self.search_result_states:
                 self.last_search_result_state = self.search_result_states.pop(0)
@@ -260,6 +272,40 @@ class BrowserControllerTests(unittest.TestCase):
                 timeout_ms=2,
                 stable_ms=1,
             )
+
+    def test_generic_stable_wait_requires_new_content_not_only_url(self):
+        self.active_page.stable_snapshots = [
+            {"url": "https://aivio.example/after", "text_hash": "same-content"},
+        ]
+        self.active_page.stable_content_states = [
+            {"text_length": 12, "loading": False},
+        ]
+        self.controller._active_page_override = self.active_page
+
+        with self.assertRaisesRegex(PlaywrightTimeoutError, "Conteúdo novo e estável"):
+            self.controller.wait_for_stable_content(
+                {"url": "https://aivio.example/before", "text_hash": "same-content"},
+                timeout_ms=2,
+                stable_ms=1,
+            )
+
+    def test_generic_stable_wait_returns_only_after_content_is_stable(self):
+        self.active_page.stable_snapshots = [
+            {"url": "https://aivio.example/results", "text_hash": "new"},
+        ] * 10
+        self.active_page.stable_content_states = [
+            {"text_length": 20, "loading": False},
+        ] * 10
+        self.controller._active_page_override = self.active_page
+
+        result = self.controller.wait_for_stable_content(
+            {"url": "https://aivio.example/search", "text_hash": "old"},
+            timeout_ms=100,
+            stable_ms=1,
+        )
+
+        self.assertEqual(result["url"], "https://aivio.example/results")
+        self.assertEqual(result["text_length"], 20)
 
     def test_endpoint_is_required_and_must_not_contain_credentials(self):
         with self.assertRaisesRegex(RuntimeError, "SCOUT_CDP_ENDPOINT"):

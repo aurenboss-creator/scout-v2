@@ -1,4 +1,5 @@
 import unittest
+import tempfile
 from pathlib import Path
 import tempfile
 import uuid
@@ -12,6 +13,7 @@ from scout.browser_operator import (
     BrowserOperatorExecutor,
     V2BrowserController,
 )
+from scout.storage import V2StateStore
 
 
 class FakeActionLocator:
@@ -1148,13 +1150,17 @@ class BrowserOperatorTests(unittest.TestCase):
             {"action": "observe"},
             {"action": "click", "target": {"role": "button", "accessible_name": "Open"}},
             {"action": "fill", "target": {"label": "Name"}, "value": "Ada"},
+            {"action": "search", "query": "dentista"},
             {"action": "select", "target": {"role": "combobox", "accessible_name": "Region"},
              "option": "North"},
             {"action": "press", "key": "Enter"},
             {"action": "scroll", "delta_y": 400},
             {"action": "wait", "target": {"role": "status", "text": "Ready"}},
             {"action": "wait", "load_state": "domcontentloaded"},
+            {"action": "wait_stable", "timeout_ms": 2_000, "stable_ms": 500},
             {"action": "read_text"},
+            {"action": "read_records", "max_items": 10},
+            {"action": "wait_stable", "timeout_ms": 2_000, "stable_ms": 500},
             {"action": "open_tab", "url": "https://example.test/other"},
             {"action": "switch_tab", "title": "Example"},
             {"action": "close_tab"},
@@ -1237,6 +1243,317 @@ class BrowserOperatorTests(unittest.TestCase):
         self.assertEqual(run.call_args_list[1].args[1]["actions"], actions)
         self.assertEqual(saved["result"], [{"observed": True}])
 
+    def test_operator_result_and_evidence_survive_executor_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "state.json"
+            store = V2StateStore(store_path)
+            result = {
+                "task_id": str(uuid.uuid4()),
+                "status": "completed",
+                "action": None,
+                "result": [{"text": "Conteúdo observado"}],
+                "evidence": [{"after": {"url": "https://example.test/"}}],
+                "operations": [{"action": "observe", "status": "completed"}],
+            }
+            executor = BrowserOperatorExecutor(state_store=store)
+            task = {"task_id": result["task_id"], "actions": [{"action": "observe"}]}
+
+            with patch.object(BrowserOperator, "execute", return_value=result):
+                output = executor.execute(task)
+            self.assertEqual(output["status"], "completed")
+            self.assertEqual(output["result_package"]["task_id"], result["task_id"])
+            package_id = output["result_package"]["package_id"]
+            self.assertEqual(store.get_result_package(package_id)["task_id"], result["task_id"])
+
+            restarted = BrowserOperatorExecutor(state_store=V2StateStore(store_path))
+
+            self.assertEqual(restarted.get_result(result["task_id"]), output)
+            with patch.object(BrowserOperator, "execute") as execute:
+                duplicate = restarted.execute(task)
+            self.assertEqual(duplicate["error"]["code"], "duplicate_task")
+            execute.assert_not_called()
+
+    def test_operator_persists_each_operation_and_progress(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = Path(directory) / "state.json"
+            executor = BrowserOperatorExecutor(
+                controller_factory=lambda: self.controller,
+                state_store=V2StateStore(store_path),
+            )
+            task = {
+                "task_id": str(uuid.uuid4()),
+                "goal": "Inspecionar tela",
+                "actions": [{"action": "observe"}],
+            }
+
+            result = executor.execute(task)
+            recovered = BrowserOperatorExecutor(
+                controller_factory=lambda: self.controller,
+                state_store=V2StateStore(store_path),
+            ).get_result(task["task_id"])
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(recovered["operations"][0]["action"], "observe")
+        self.assertEqual(recovered["progress"]["completed_actions"], 1)
+
+    def test_interrupted_operator_keeps_history_and_is_not_replayed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            store = V2StateStore(path)
+            task_id = str(uuid.uuid4())
+            store.create_operator_task(task_id, {
+                "task_id": task_id,
+                "status": "running",
+                "worker_pid": -1,
+                "actions": [{"action": "click"}],
+                "operations": [{"action": "click", "status": "completed"}],
+                "evidence": [{"after": {"url": "https://example.test/"}}],
+                "progress": {"completed_actions": 1, "total_actions": 2},
+                "result": None,
+            })
+
+            executor = BrowserOperatorExecutor(state_store=V2StateStore(path))
+            recovered = executor.get_result(task_id)
+            recovered_package = V2StateStore(path).get_result_package(
+                recovered["result_package"]["package_id"]
+            )
+
+        self.assertEqual(recovered["status"], "failed")
+        self.assertEqual(recovered["error"]["code"], "task_interrupted")
+        self.assertEqual(recovered["operations"][0]["action"], "click")
+        self.assertEqual(recovered["progress"]["completed_actions"], 1)
+        self.assertEqual(recovered["result_package"]["execution"]["status"], "failed")
+        self.assertEqual(recovered_package["task_id"], task_id)
+
+    def test_wait_stable_uses_controller_verification(self):
+        expected = {
+            "url": "https://example.test/results",
+            "text_hash": "new",
+            "text_length": 22,
+            "stable_ms": 500,
+        }
+        with patch.object(
+            self.controller,
+            "wait_for_stable_content",
+            return_value=expected,
+        ) as wait_stable:
+            result = self.operator.execute({
+                "task_id": str(uuid.uuid4()),
+                "goal": "Ler resultados atualizados",
+                "actions": [{
+                    "action": "wait_stable",
+                    "timeout_ms": 2_000,
+                    "stable_ms": 500,
+                }],
+            })
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["operations"][0]["result"], expected)
+        wait_stable.assert_called_once()
+
+    def test_wait_stable_rejects_invalid_timeout_relationship(self):
+        with self.assertRaisesRegex(ValueError, "não superar timeout_ms"):
+            BrowserOperator.validate_task({
+                "task_id": str(uuid.uuid4()),
+                "actions": [{
+                    "action": "wait_stable",
+                    "timeout_ms": 100,
+                    "stable_ms": 200,
+                }],
+            })
+
+    def test_search_uses_unique_accessible_input_button_and_waits_for_stability(self):
+        inspection = {
+            "inputs": [{"type": "search", "aria_label": "Pesquisar empresas"}],
+            "buttons": [{"text": "Buscar", "aria_label": "", "disabled": False}],
+        }
+        found = {"found": True, "element": {"type": "search"}}
+        stable = {"url": "https://example.test/results", "text_hash": "new", "text_length": 20}
+        with tempfile.TemporaryDirectory() as directory:
+            executor = BrowserOperatorExecutor(
+                controller_factory=lambda: self.controller,
+                state_store=V2StateStore(Path(directory) / "state.json"),
+            )
+            with (
+                patch.object(self.controller, "inspectPage", return_value=inspection),
+                patch.object(self.controller, "find_element", return_value=found),
+                patch.object(self.controller, "wait_for_semantic_target", return_value=True),
+                patch.object(self.controller, "fill_semantic_input", return_value={"filled": True}) as fill,
+                patch.object(self.controller, "click_element", return_value={"clicked": True}) as click,
+                patch.object(self.controller, "wait_for_stable_content", return_value=stable) as wait_stable,
+            ):
+                result = executor.execute({
+                    "task_id": str(uuid.uuid4()),
+                    "goal": "Pesquisar empresas",
+                    "actions": [{"action": "search", "query": "dentistas"}],
+                })
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["operations"][0]["result"]["query"], "dentistas")
+        self.assertEqual(result["result_package"]["objective"], "Pesquisar empresas")
+        self.assertEqual(fill.call_args.args[0], "dentistas")
+        click.assert_called_once()
+        wait_stable.assert_called_once()
+
+    def test_search_rejects_ambiguous_fields_before_typing(self):
+        inspection = {
+            "inputs": [
+                {"type": "search", "aria_label": "Pesquisar por nome"},
+                {"type": "search", "aria_label": "Pesquisar por endereço"},
+            ],
+            "buttons": [],
+        }
+        with (
+            patch.object(self.controller, "inspectPage", return_value=inspection),
+            patch.object(self.controller, "fill_semantic_input") as fill,
+        ):
+            result = self.operator.execute({
+                "task_id": str(uuid.uuid4()),
+                "actions": [{"action": "search", "query": "dentistas"}],
+            })
+
+        self.assertEqual(result["status"], "needs_human")
+        self.assertIn("único campo", result["error"]["message"])
+        fill.assert_not_called()
+
+    def test_declarative_research_navigates_only_to_validated_auren_source(self):
+        task = {
+            "task_id": str(uuid.uuid4()),
+            "goal": "Buscar empresas na fonte aprovada",
+            "query": "restaurantes",
+            "start_url": "https://directory.example/search",
+        }
+
+        planned = BrowserOperator.validate_task(task)
+
+        self.assertEqual(planned["actions"][0], {
+            "action": "navigate",
+            "url": "https://directory.example/search",
+            "timeout_ms": 20_000,
+        })
+        for unsafe_url in ("file:///etc/passwd", "https://user:pass@example.test/search"):
+            with self.subTest(url=unsafe_url), self.assertRaisesRegex(ValueError, "start_url"):
+                BrowserOperator.validate_task({**task, "start_url": unsafe_url})
+
+    def test_declarative_research_plans_search_reads_records_and_returns_structured_lead(self):
+        task_id = str(uuid.uuid4())
+        raw_record = {
+            "title": "Restaurante Local",
+            "text": "Restaurante Local\nAtende no salão\nTelefone: (51) 99999-0000",
+            "links": [{
+                "text": "Empresa",
+                "url": "https://directory.example/company/1",
+            }],
+            "source_url": "https://directory.example/search?q=restaurantes",
+        }
+        browser_result = {
+            "task_id": task_id,
+            "status": "completed",
+            "action": {"index": 1, "name": "read_records"},
+            "result": [
+                {"query": "restaurantes Porto Alegre", "stable_content": {"text_hash": "new"}},
+                {"count": 1, "records": [raw_record], "source_url": raw_record["source_url"]},
+            ],
+            "evidence": [],
+            "operations": [
+                {"action": "search", "status": "completed"},
+                {"action": "read_records", "status": "completed"},
+            ],
+        }
+        task = {
+            "task_id": task_id,
+            "goal": "Encontrar restaurantes locais",
+            "query": "restaurantes Porto Alegre",
+            "quantity": 5,
+            "niche": "restaurantes",
+            "locality": "Porto Alegre, RS",
+            "inclusion_criteria": ["Atende no salão"],
+            "exclusion_criteria": ["franquia"],
+            "fields_of_interest": ["company_name", "phone", "source_url"],
+        }
+        validated = BrowserOperator.validate_task(task)
+        self.assertEqual(
+            [item["action"] for item in validated["actions"]],
+            ["search", "read_records"],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            executor = BrowserOperatorExecutor(
+                controller_factory=lambda: self.controller,
+                state_store=V2StateStore(Path(directory) / "state.json"),
+            )
+            with patch.object(BrowserOperator, "execute", return_value=browser_result):
+                result = executor.execute(task)
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["leads"][0]["company_name"], "Restaurante Local")
+        self.assertEqual(result["leads"][0]["phone"], "51999990000")
+        self.assertEqual(result["leads"][0]["source"], "directory.example")
+        self.assertEqual(result["research"]["found_count"], 1)
+        self.assertEqual(result["result_package"]["criteria"]["include"], ["Atende no salão"])
+        self.assertEqual(result["result_package"]["results"][0]["qualification"]["status"], "qualified")
+
+    def test_declarative_research_deduplicates_across_batches_without_collapsing_shared_source(self):
+        source_url = "https://directory.example/search"
+
+        def record(name, number):
+            return {
+                "title": name,
+                "text": f"{name}\nTelefone: {number}",
+                "links": [{
+                    "text": "Empresa",
+                    "url": f"https://directory.example/company/{name.casefold().replace(' ', '-')}",
+                }],
+                "source_url": source_url,
+            }
+
+        first_task_id = str(uuid.uuid4())
+        second_task_id = str(uuid.uuid4())
+        task_template = {
+            "goal": "Pesquisar restaurantes",
+            "query": "restaurantes",
+            "quantity": 2,
+            "niche": "restaurantes",
+            "fields_of_interest": ["company_name", "phone", "source_url"],
+        }
+        first_browser_result = {
+            "task_id": first_task_id,
+            "status": "completed",
+            "result": [{"count": 2, "records": [
+                record("Restaurante Um", "(51) 99999-0001"),
+                record("Restaurante Dois", "(51) 99999-0002"),
+            ]}],
+            "operations": [], "evidence": [],
+        }
+        second_browser_result = {
+            "task_id": second_task_id,
+            "status": "completed",
+            "result": [{"count": 2, "records": [
+                record("Restaurante Um", "(51) 99999-0001"),
+                record("Restaurante Três", "(51) 99999-0003"),
+            ]}],
+            "operations": [], "evidence": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            store = V2StateStore(Path(directory) / "state.json")
+            executor = BrowserOperatorExecutor(
+                controller_factory=lambda: self.controller,
+                state_store=store,
+            )
+            with patch.object(
+                BrowserOperator,
+                "execute",
+                side_effect=[first_browser_result, second_browser_result],
+            ):
+                first = executor.execute({**task_template, "task_id": first_task_id})
+                second = executor.execute({**task_template, "task_id": second_task_id})
+
+        self.assertEqual([lead["company_name"] for lead in first["leads"]], [
+            "Restaurante Um", "Restaurante Dois",
+        ])
+        self.assertEqual([lead["company_name"] for lead in second["leads"]], ["Restaurante Três"])
+        self.assertEqual(second["research"]["duplicates_skipped"], 1)
+        self.assertEqual(len(store.load_leads()), 3)
+
     def test_ambiguous_semantic_target_returns_structured_failure_without_clicking(self):
         class AmbiguousLocator(FakeActionLocator):
             def count(self):
@@ -1255,8 +1572,8 @@ class BrowserOperatorTests(unittest.TestCase):
             }],
         })
 
-        self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["error"]["code"], "operation_failed")
+        self.assertEqual(result["status"], "needs_human")
+        self.assertEqual(result["error"]["code"], "human_intervention_required")
         self.assertIn("ambíguo", result["error"]["message"])
         self.assertEqual(result["operations"][0]["status"], "failed")
         self.assertEqual(button.click_count, 0)

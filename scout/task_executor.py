@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import importlib
 import logging
 import os
 import re
@@ -10,7 +11,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from hashlib import sha256
 from threading import RLock
-from typing import Any, Generator
+from typing import Any, Generator, cast
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
@@ -18,6 +19,7 @@ from scout.aivio import AivioIntegration, CDP_ENDPOINT
 from scout.browser_controller import BrowserController
 from scout.lead_normalization import deduplicate_leads
 from scout.storage import V2StateStore
+from scout.v2_delivery import build_result_package, evaluate_lead_criteria
 from scout.v2_models import (
     LeadTaskPayload,
     SearchLeadsPayload,
@@ -67,7 +69,7 @@ def _browser_execution_lock(endpoint: str) -> Generator[None, None, None]:
             lock_file.flush()
         lock_file.seek(0)
         if os.name == "nt":
-            import msvcrt
+            msvcrt = cast(Any, importlib.import_module("msvcrt"))
 
             while True:
                 try:
@@ -112,8 +114,12 @@ class TaskExecutor:
         )
         self.state_store = state_store or V2StateStore()
         self._task_results: dict[str, TaskResult] = {}
+        self._task_requests: dict[str, dict[str, Any]] = {}
         self._task_results_lock = RLock()
         for task_id, record in self.state_store.load_task_records().items():
+            task_request = record.get("_task_request")
+            if isinstance(task_request, dict):
+                self._task_requests[task_id] = task_request
             result = self._result_from_dict(record)
             if (
                 result.status in {TaskStatus.QUEUED, TaskStatus.RUNNING}
@@ -126,7 +132,14 @@ class TaskExecutor:
                 }
                 result.errors.append(result.error["message"])
                 result.finished_at = datetime.now(timezone.utc).isoformat()
-                self.state_store.save_task_record(task_id, result.to_dict())
+                request = self._task_requests.get(task_id)
+                if request is not None and result.type == TaskType.SEARCH_LEADS:
+                    recovered_task = Task.from_dict(request)
+                    package = build_result_package(recovered_task, result)
+                    self.state_store.save_result_package(task_id, package)
+                    result.result_package = package
+                    result.data["package_id"] = package["package_id"]
+                self._persist_result(result)
             self._task_results[task_id] = result
 
     def execute(self, value: Task | dict[str, Any]) -> TaskResult:
@@ -139,12 +152,14 @@ class TaskExecutor:
             finished_at="",
             worker_pid=os.getpid(),
         )
+        task_request = self._serialize_task(task)
         with self._task_results_lock:
-            if (
-                task.task_id in self._task_results
-                or not self.state_store.create_task_record(task.task_id, queued_result.to_dict())
-            ):
+            if task.task_id in self._task_results:
                 raise ValueError(f"task_id já foi executado: {task.task_id}")
+            task_record = {**queued_result.to_dict(), "_task_request": task_request}
+            if not self.state_store.create_task_record(task.task_id, task_record):
+                raise ValueError(f"task_id já foi executado: {task.task_id}")
+            self._task_requests[task.task_id] = task_request
             self._task_results[task.task_id] = queued_result
         try:
             with _browser_execution_lock(self._browser_endpoint):
@@ -155,6 +170,11 @@ class TaskExecutor:
                 result = self._execute_task(task, queued_result)
                 with self._task_results_lock:
                     result.finished_at = datetime.now(timezone.utc).isoformat()
+                    if task.type == TaskType.SEARCH_LEADS:
+                        package = build_result_package(task, result)
+                        self.state_store.save_result_package(task.task_id, package)
+                        result.result_package = package
+                        result.data["package_id"] = package["package_id"]
                     self._persist_result(result)
                 return result
         except Exception as error:
@@ -185,10 +205,26 @@ class TaskExecutor:
                 type=result.type,
                 status=status,
                 progress=dict(result.progress),
+                progress_events=[dict(event) for event in result.progress_events],
                 started_at=result.started_at,
                 finished_at="",
             )
             return snapshot.to_dict()
+
+    def get_result_package(self, task_id_or_package_id: str) -> dict[str, Any] | None:
+        return self.state_store.get_result_package(task_id_or_package_id)
+
+    def list_result_packages(self, delivery_status: str | None = None) -> list[dict[str, Any]]:
+        return self.state_store.list_result_packages(delivery_status)
+
+    def record_result_delivery(
+        self,
+        package_id: str,
+        status: str,
+        *,
+        detail: str | None = None,
+    ) -> dict[str, Any] | None:
+        return self.state_store.record_package_delivery(package_id, status, detail=detail)
 
     def _execute_task(self, task: Task, result: TaskResult) -> TaskResult:
         try:
@@ -259,11 +295,45 @@ class TaskExecutor:
             connect()
 
     def _persist_result(self, result: TaskResult) -> None:
-        self.state_store.save_task_record(result.task_id, result.to_dict())
+        record = result.to_dict()
+        task_request = self._task_requests.get(result.task_id)
+        if task_request is not None:
+            record["_task_request"] = task_request
+        self.state_store.save_task_record(result.task_id, record)
+
+    @staticmethod
+    def _serialize_task(task: Task) -> dict[str, Any]:
+        if isinstance(task.payload, SearchLeadsPayload):
+            payload: dict[str, Any] = {
+                "city": task.payload.city,
+                "state": task.payload.state,
+                "category": task.payload.category,
+                "quantity": task.payload.quantity,
+                "filters": task.payload.filters,
+                "objective": task.payload.objective,
+                "inclusion_criteria": task.payload.inclusion_criteria,
+                "exclusion_criteria": task.payload.exclusion_criteria,
+                "fields_of_interest": task.payload.fields_of_interest,
+            }
+        elif isinstance(task.payload, LeadTaskPayload):
+            payload = {"lead": task.payload.lead.to_dict()}
+        else:
+            payload = {}
+        return {
+            "task_id": task.task_id,
+            "type": task.type.value,
+            "created_at": task.created_at,
+            "payload": payload,
+            "authorization": dict(task.authorization),
+        }
 
     def _update_progress(self, result: TaskResult, progress: dict[str, Any]) -> None:
         with self._task_results_lock:
             result.progress = dict(progress)
+            result.progress_events.append({
+                **progress,
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
+            })
             self._persist_result(result)
 
     @staticmethod
@@ -279,6 +349,8 @@ class TaskExecutor:
                 errors=record.get("errors", []),
                 warnings=record.get("warnings", []),
                 progress=record.get("progress", {}),
+                progress_events=record.get("progress_events", []),
+                result_package=record.get("result_package"),
                 worker_pid=record.get("worker_pid"),
                 error=record.get("error"),
                 started_at=record.get("started_at", ""),
@@ -319,9 +391,53 @@ class TaskExecutor:
             on_progress=lambda progress: self._update_progress(result, progress),
         )
         known_leads = [V2Lead.from_dict(item) for item in self.state_store.load_leads()]
-        batch_leads = [V2Lead.from_dict(item) for item in search["results"]]
+        observed_batch = [V2Lead.from_dict(item) for item in search["results"]]
+        batch_leads: list[V2Lead] = []
+        excluded_results: list[dict[str, Any]] = []
+        unverified_count = 0
+        for lead in observed_batch:
+            criteria_result = evaluate_lead_criteria(
+                self._lead_evidence_text(lead),
+                payload.inclusion_criteria,
+                payload.exclusion_criteria,
+            )
+            if criteria_result["status"] == "excluded":
+                excluded_results.append(lead.to_dict())
+                continue
+            if criteria_result["criteria_unverified"]:
+                unverified_count += 1
+            batch_leads.append(lead)
+        if excluded_results:
+            result.warnings.append(
+                f"{len(excluded_results)} resultado(s) foram separados por correspondência explícita com critério de exclusão."
+            )
+        if unverified_count:
+            result.warnings.append(
+                f"{unverified_count} resultado(s) não têm evidência textual para todos os critérios de inclusão."
+            )
         known_ids = {lead.lead_id for lead in known_leads}
+        duplicate_offsets = {
+            lead.lead_id: len(lead.raw_data.get("duplicates", []))
+            if isinstance(lead.raw_data.get("duplicates"), list) else 0
+            for lead in known_leads
+        }
         combined_leads = deduplicate_leads(known_leads + batch_leads)
+        duplicate_records: list[dict[str, Any]] = []
+        for lead in combined_leads:
+            observed_duplicates = lead.raw_data.get("duplicates", [])
+            if not isinstance(observed_duplicates, list):
+                continue
+            for duplicate in observed_duplicates[duplicate_offsets.get(lead.lead_id, 0):]:
+                if not isinstance(duplicate, dict):
+                    continue
+                raw_search = duplicate.get("search_result", {})
+                if not isinstance(raw_search, dict):
+                    raw_search = {}
+                duplicate_records.append({
+                    "company_name": raw_search.get("title"),
+                    "source_url": raw_search.get("source_url") or raw_search.get("url"),
+                    "deduplicated_to": lead.lead_id,
+                })
         self.state_store.replace_leads([lead.to_dict() for lead in combined_leads])
         result.leads = [lead for lead in combined_leads if lead.lead_id not in known_ids]
         duplicate_count = max(0, len(batch_leads) - len(result.leads))
@@ -339,9 +455,31 @@ class TaskExecutor:
             "total": len(result.leads),
             "unique_total": len(combined_leads),
             "duplicates_skipped": duplicate_count,
+            "duplicates": duplicate_records,
+            "excluded_results": excluded_results,
+            "limitations": [
+                "Critérios textuais são verificados somente contra conteúdo visível coletado; critérios ausentes permanecem não verificados."
+            ] if payload.inclusion_criteria or payload.exclusion_criteria else [],
         }
-        if search["status"] == "partial" or warnings or duplicate_count:
+        if search["status"] == "partial" or warnings or duplicate_count or excluded_results or unverified_count:
             result.status = TaskStatus.PARTIAL
+        self._update_progress(result, {
+            "phase": "completed",
+            "found": len(result.leads),
+            "requested": payload.quantity,
+        })
+
+    @staticmethod
+    def _lead_evidence_text(lead: V2Lead) -> str:
+        raw = lead.raw_data if isinstance(lead.raw_data, dict) else {}
+        search = raw.get("search_result", {})
+        details = raw.get("company_details", {})
+        values = [
+            lead.company_name, lead.address, lead.city, lead.state, lead.category,
+            search.get("text") if isinstance(search, dict) else None,
+            details.get("text") if isinstance(details, dict) else None,
+        ]
+        return " ".join(value for value in values if isinstance(value, str))
 
     def _open_company(self, task: Task, result: TaskResult) -> None:
         payload = task.payload

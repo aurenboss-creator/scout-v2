@@ -4,7 +4,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlsplit, urlunsplit
 
 from playwright.sync_api import (
@@ -616,7 +616,7 @@ class BrowserController:
         if role and accessible_name:
             strategies.append((
                 "role+nome acessível",
-                page.get_by_role(role, name=accessible_name, exact=True),
+                page.get_by_role(cast(Any, role), name=accessible_name, exact=True),
             ))
         if text:
             strategies.append(("texto exato", page.get_by_text(text, exact=True)))
@@ -1111,9 +1111,9 @@ class BrowserController:
         if role:
             strategies.append((
                 "role",
-                page.get_by_role(role, name=trigger, exact=True)
+                page.get_by_role(cast(Any, role), name=trigger, exact=True)
                 if trigger
-                else page.get_by_role(role),
+                else page.get_by_role(cast(Any, role)),
             ))
         if trigger:
             strategies.extend((
@@ -1342,7 +1342,7 @@ class BrowserController:
                 clientHeight: scroller ? scroller.clientHeight : null
               };
             }""",
-            {"shouldScroll": should_scroll, "initialState": self._dropdown_initial_state},
+            cast(Any, {"shouldScroll": should_scroll, "initialState": self._dropdown_initial_state}),
         )
 
     def wait_for_dropdown_open(self, *, timeout_ms: int = 5_000) -> bool:
@@ -1538,7 +1538,7 @@ class BrowserController:
         if role and accessible_name:
             strategies.append((
                 "role+nome acessível",
-                page.get_by_role(role, name=accessible_name, exact=True),
+                page.get_by_role(cast(Any, role), name=accessible_name, exact=True),
             ))
         if text:
             strategies.append(("texto exato", page.get_by_text(text, exact=True)))
@@ -1819,6 +1819,59 @@ class BrowserController:
         if not self.verify_page_changed(before, timeout_ms):
             raise PlaywrightTimeoutError(f"A página não mudou em {timeout_ms} ms")
         return True
+
+    def wait_for_stable_content(
+        self,
+        before: dict[str, str],
+        timeout_ms: int = 20_000,
+        stable_ms: int = 750,
+    ) -> dict[str, Any]:
+        self._validate_timeout(timeout_ms)
+        if isinstance(stable_ms, bool) or not isinstance(stable_ms, int) or stable_ms < 1:
+            raise ValueError("stable_ms deve ser um inteiro positivo")
+        page = self.getActivePage()
+        if page is None:
+            raise RuntimeError("Não há uma aba ativa disponível")
+        deadline = time.monotonic() + timeout_ms / 1_000
+        previous_signature: tuple[str, str] | None = None
+        stable_since: float | None = None
+        while True:
+            snapshot = self._snapshot_page(page)
+            state = page.evaluate(
+                """() => {
+                  const root = document.querySelector('main,[role="main"]') || document.body;
+                  const text = (root && root.innerText || '').trim();
+                  const loading = Boolean(document.querySelector(
+                    '[aria-busy="true"],[role="progressbar"],[data-loading="true"]'
+                  )) || /carregando|loading\\.\\.\\.|buscando resultados/i.test(text);
+                  return {text_length: text.length, loading};
+                }"""
+            )
+            if not isinstance(state, dict):
+                raise RuntimeError("O estado de estabilidade do DOM é inválido")
+            signature = (snapshot.get("url", ""), snapshot.get("text_hash", ""))
+            fresh = snapshot.get("text_hash") != before.get("text_hash")
+            if fresh and state.get("text_length", 0) > 0 and not state.get("loading"):
+                now = time.monotonic()
+                if signature != previous_signature:
+                    previous_signature = signature
+                    stable_since = now
+                elif stable_since is not None and (now - stable_since) * 1_000 >= stable_ms:
+                    return {
+                        "url": self._safe_page_url(snapshot["url"]),
+                        "text_hash": snapshot["text_hash"],
+                        "text_length": state["text_length"],
+                        "stable_ms": stable_ms,
+                    }
+            else:
+                previous_signature = None
+                stable_since = None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise PlaywrightTimeoutError(
+                    f"Conteúdo novo e estável não apareceu em {timeout_ms} ms"
+                )
+            page.wait_for_timeout(min(100, max(1, int(remaining * 1_000))))
 
     def press_key(self, key: str) -> None:
         normalized = key.strip().casefold() if isinstance(key, str) else ""

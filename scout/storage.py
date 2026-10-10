@@ -1,10 +1,12 @@
 import json
 import os
+import importlib
 import tempfile
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock, RLock
-from typing import Any, Generator
+from typing import Any, Generator, cast
 
 from scout.models import Lead
 
@@ -32,7 +34,12 @@ class V2StateStore:
         default_path = Path.home() / ".auren-scout-v2" / "state.json"
         self.path = Path(path or os.getenv("SCOUT_V2_STATE_PATH") or default_path)
         self._lock = RLock()
-        self._state: dict[str, Any] = {"tasks": {}, "leads": {}}
+        self._state: dict[str, Any] = {
+            "tasks": {},
+            "leads": {},
+            "operator_tasks": {},
+            "result_packages": {},
+        }
         self._reload()
 
     def _reload(self) -> None:
@@ -45,6 +52,12 @@ class V2StateStore:
                 not isinstance(loaded, dict)
                 or not isinstance(loaded.get("tasks"), dict)
                 or not isinstance(loaded.get("leads"), dict)
+            ):
+                raise RuntimeError(f"Formato inválido no estado V2: {self.path}")
+            loaded.setdefault("operator_tasks", {})
+            loaded.setdefault("result_packages", {})
+            if not isinstance(loaded["operator_tasks"], dict) or not isinstance(
+                loaded["result_packages"], dict
             ):
                 raise RuntimeError(f"Formato inválido no estado V2: {self.path}")
             self._state = loaded
@@ -97,6 +110,101 @@ class V2StateStore:
             self._state["leads"] = indexed
             self._write()
 
+    def create_operator_task(self, task_id: str, record: dict[str, Any]) -> bool:
+        with self._lock, self._state_file_lock():
+            self._reload()
+            if task_id in self._state["operator_tasks"]:
+                return False
+            self._state["operator_tasks"][task_id] = self._copy_json(record)
+            self._write()
+            return True
+
+    def save_operator_task(self, task_id: str, record: dict[str, Any]) -> None:
+        with self._lock, self._state_file_lock():
+            self._reload()
+            self._state["operator_tasks"][task_id] = self._copy_json(record)
+            self._write()
+
+    def get_operator_task(self, task_id: str) -> dict[str, Any] | None:
+        with self._lock, self._state_file_lock():
+            self._reload()
+            record = self._state["operator_tasks"].get(task_id)
+            return self._copy_json(record) if isinstance(record, dict) else None
+
+    def load_operator_tasks(self) -> dict[str, dict[str, Any]]:
+        with self._lock, self._state_file_lock():
+            self._reload()
+            return self._copy_json(self._state["operator_tasks"])
+
+    def save_result_package(self, task_id: str, package: dict[str, Any]) -> None:
+        package_id = package.get("package_id")
+        if not isinstance(package_id, str) or not package_id:
+            raise ValueError("Pacote de resultado exige package_id")
+        with self._lock, self._state_file_lock():
+            self._reload()
+            self._state["result_packages"][task_id] = self._copy_json(package)
+            self._write()
+
+    def get_result_package(self, task_id_or_package_id: str) -> dict[str, Any] | None:
+        with self._lock, self._state_file_lock():
+            self._reload()
+            package = self._state["result_packages"].get(task_id_or_package_id)
+            if package is None:
+                package = next((
+                    item for item in self._state["result_packages"].values()
+                    if item.get("package_id") == task_id_or_package_id
+                ), None)
+            return self._copy_json(package) if isinstance(package, dict) else None
+
+    def list_result_packages(
+        self,
+        delivery_status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        with self._lock, self._state_file_lock():
+            self._reload()
+            packages = list(self._state["result_packages"].values())
+            if delivery_status is not None:
+                packages = [
+                    package for package in packages
+                    if package.get("delivery", {}).get("status") == delivery_status
+                ]
+            return self._copy_json(packages)
+
+    def record_package_delivery(
+        self,
+        package_id: str,
+        status: str,
+        *,
+        detail: str | None = None,
+    ) -> dict[str, Any] | None:
+        if status not in {"delivered", "failed"}:
+            raise ValueError("delivery status deve ser delivered ou failed")
+        with self._lock, self._state_file_lock():
+            self._reload()
+            package = next((
+                item for item in self._state["result_packages"].values()
+                if item.get("package_id") == package_id
+            ), None)
+            if package is None:
+                return None
+            delivery = package.setdefault("delivery", {
+                "status": "pending",
+                "attempts": 0,
+                "last_attempt_at": None,
+                "delivered_at": None,
+                "error": None,
+            })
+            if delivery.get("status") == "delivered":
+                return self._copy_json(package)
+            delivery["attempts"] = int(delivery.get("attempts", 0)) + 1
+            delivery["last_attempt_at"] = datetime.now(timezone.utc).isoformat()
+            delivery["status"] = status
+            delivery["error"] = detail if status == "failed" else None
+            if status == "delivered":
+                delivery["delivered_at"] = delivery["last_attempt_at"]
+            self._write()
+            return self._copy_json(package)
+
     @contextmanager
     def _state_file_lock(self) -> Generator[None, None, None]:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -110,7 +218,7 @@ class V2StateStore:
                 lock_file.flush()
             lock_file.seek(0)
             if os.name == "nt":
-                import msvcrt
+                msvcrt = cast(Any, importlib.import_module("msvcrt"))
 
                 msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
                 try:
